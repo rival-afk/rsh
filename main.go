@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
@@ -128,6 +129,51 @@ func netToken() string {
 	return loadRshConfig().NetToken
 }
 
+// authClient is the shared HTTP client for auth-server calls. Its dialer
+// rewrites the destination IP for hostnames found in ~/.rsh/hosts (hosts
+// file format). This lets rsh reach https://auth.rival-afk.com on Android,
+// where Go's pure (cgo-less) resolver cannot do DNS — while the TLS ServerName
+// still comes from the URL, so the Let's Encrypt cert keeps validating.
+var authClient = newAuthClient()
+
+func newAuthClient() *http.Client {
+	hm := hostMap()
+	dialer := &net.Dialer{Timeout: 12 * time.Second}
+	tr := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if host, port, err := net.SplitHostPort(addr); err == nil {
+				if ip, ok := hm[host]; ok {
+					addr = net.JoinHostPort(ip, port)
+				}
+			}
+			return dialer.DialContext(ctx, network, addr)
+		},
+		TLSHandshakeTimeout: 12 * time.Second,
+	}
+	return &http.Client{Timeout: 20 * time.Second, Transport: tr}
+}
+
+// hostMap reads hostname->IP entries from an optional hosts-format file at
+// ~/.rsh/hosts so auth.rival-afk.com resolves without a working system DNS.
+func hostMap() map[string]string {
+	m := map[string]string{}
+	b, err := os.ReadFile(filepath.Join(rshDir(), "hosts"))
+	if err != nil {
+		return m
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(strings.SplitN(line, "#", 2)[0])
+		f := strings.Fields(line)
+		if len(f) < 2 {
+			continue
+		}
+		for _, name := range f[1:] {
+			m[name] = f[0]
+		}
+	}
+	return m
+}
+
 func normalizePubFromSSH(sp ssh.PublicKey) string {
 	return strings.TrimSpace(string(ssh.MarshalAuthorizedKey(sp)))
 }
@@ -196,7 +242,7 @@ func doAuth(baseURL string, k authKey) (*authResp, error) {
 		"ts":     ts,
 		"sig":    hex.EncodeToString(sig),
 	})
-	resp, err := http.Post(baseURL+"/v1/auth", "application/json", bytes.NewReader(body))
+	resp, err := authClient.Post(baseURL+"/v1/auth", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -263,7 +309,7 @@ func apiPost(base, path, token string, payload interface{}) (int, []byte, error)
 	req, _ := http.NewRequest("POST", base+path, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := authClient.Do(req)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -275,7 +321,7 @@ func apiPost(base, path, token string, payload interface{}) (int, []byte, error)
 func apiDo(base, method, path, token string) (int, []byte, error) {
 	req, _ := http.NewRequest(method, base+path, nil)
 	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := authClient.Do(req)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -752,7 +798,7 @@ func netTokenHTTP(method, url string, body []byte) (int, []byte, error) {
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := authClient.Do(req)
 	if err != nil {
 		return 0, nil, err
 	}
