@@ -1,0 +1,975 @@
+package main
+
+import (
+	"bytes"
+	"crypto/ed25519"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"golang.org/x/crypto/ssh"
+)
+
+// isExecutable reports whether path is a regular executable file.
+// Uses os.Stat (stat syscall) to avoid faccessat2, which Android seccomp blocks.
+func isExecutable(path string) bool {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	return !fi.IsDir() && fi.Mode()&0o111 != 0
+}
+
+// lookPath finds an executable by name in PATH without using the access(2)
+// family of syscalls (blocked by Android's seccomp, causing SIGSYS).
+func lookPath(file string) (string, error) {
+	if strings.Contains(file, "/") {
+		if isExecutable(file) {
+			return file, nil
+		}
+		return "", fmt.Errorf("%s: not executable", file)
+	}
+	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
+		if dir == "" {
+			dir = "."
+		}
+		p := filepath.Join(dir, file)
+		if isExecutable(p) {
+			return p, nil
+		}
+	}
+	return "", fmt.Errorf("%s: not found in PATH", file)
+}
+
+func sshKeygenPath() string {
+	if p, err := lookPath("ssh-keygen"); err == nil {
+		return p
+	}
+	return "ssh-keygen"
+}
+
+const defaultAuthURL = "https://auth.rival-afk.com"
+
+type authKey struct {
+	priv ed25519.PrivateKey
+	pub  string // normalized "ssh-ed25519 AAAA..."
+}
+
+type authResp struct {
+	Token string   `json:"token"`
+	Role  string   `json:"role"`
+	Hosts []string `json:"hosts"`
+	Exp   int64    `json:"exp"`
+}
+
+type sshKeyResp struct {
+	Host       string `json:"host"`
+	User       string `json:"user"`
+	Addr       string `json:"addr"`
+	Port       int    `json:"port"`
+	PrivateKey string `json:"private_key"`
+	Jump       *struct {
+		Addr       string `json:"addr"`
+		Port       int    `json:"port"`
+		User       string `json:"user"`
+		PrivateKey string `json:"private_key"`
+	} `json:"jump"`
+}
+
+func rshDir() string {
+	h, _ := os.UserHomeDir()
+	return filepath.Join(h, ".rsh")
+}
+
+func authURL() string {
+	if v := os.Getenv("RSH_AUTH_URL"); v != "" {
+		return v
+	}
+	b, err := os.ReadFile(filepath.Join(rshDir(), "config.json"))
+	if err == nil {
+		var c struct {
+			AuthURL string `json:"auth_url"`
+		}
+		if json.Unmarshal(b, &c) == nil && c.AuthURL != "" {
+			return c.AuthURL
+		}
+	}
+	return defaultAuthURL
+}
+
+type rshConfig struct {
+	AuthURL  string `json:"auth_url"`
+	NetToken string `json:"net_token"`
+}
+
+func loadRshConfig() rshConfig {
+	var c rshConfig
+	b, err := os.ReadFile(filepath.Join(rshDir(), "config.json"))
+	if err == nil {
+		json.Unmarshal(b, &c)
+	}
+	return c
+}
+
+func netToken() string {
+	if v := os.Getenv("RSH_NET_TOKEN"); v != "" {
+		return v
+	}
+	return loadRshConfig().NetToken
+}
+
+func normalizePubFromSSH(sp ssh.PublicKey) string {
+	return strings.TrimSpace(string(ssh.MarshalAuthorizedKey(sp)))
+}
+
+func loadAuthKeys() ([]authKey, error) {
+	dir := rshDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read %s: %v (run `rsh keygen` first)", dir, err)
+	}
+	names := []string{}
+	for _, e := range entries {
+		if !e.IsDir() {
+			names = append(names, e.Name())
+		}
+	}
+	for _, pref := range []string{"id", "id_ed25519"} {
+		for i, n := range names {
+			if n == pref {
+				names = append(names[:i], names[i+1:]...)
+				names = append([]string{pref}, names...)
+				break
+			}
+		}
+	}
+	var keys []authKey
+	for _, n := range names {
+		if strings.HasSuffix(n, ".pub") || n == "config.json" || n == "known_hosts" {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join(dir, n))
+		if err != nil {
+			continue
+		}
+		raw, err := ssh.ParseRawPrivateKey(b)
+		if err != nil {
+			continue
+		}
+		var priv ed25519.PrivateKey
+		switch t := raw.(type) {
+		case ed25519.PrivateKey:
+			priv = t
+		case *ed25519.PrivateKey:
+			priv = *t
+		default:
+			continue
+		}
+		sshPub, err := ssh.NewPublicKey(priv.Public().(ed25519.PublicKey))
+		if err != nil {
+			continue
+		}
+		keys = append(keys, authKey{priv: priv, pub: normalizePubFromSSH(sshPub)})
+	}
+	if len(keys) == 0 {
+		return nil, fmt.Errorf("no usable ed25519 key found in %s (run `rsh keygen`)", dir)
+	}
+	return keys, nil
+}
+
+func doAuth(baseURL string, k authKey) (*authResp, error) {
+	ts := time.Now().Unix()
+	msg := fmt.Sprintf("rival-auth-v1|%s|%d", k.pub, ts)
+	sig := ed25519.Sign(k.priv, []byte(msg))
+	body, _ := json.Marshal(map[string]interface{}{
+		"pubkey": k.pub,
+		"ts":     ts,
+		"sig":    hex.EncodeToString(sig),
+	})
+	resp, err := http.Post(baseURL+"/v1/auth", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("auth failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	var ar authResp
+	if err := json.Unmarshal(b, &ar); err != nil {
+		return nil, err
+	}
+	return &ar, nil
+}
+
+func authenticate() (*authResp, error) {
+	keys, err := loadAuthKeys()
+	if err != nil {
+		return nil, err
+	}
+	base := authURL()
+	var lastErr error
+	for _, k := range keys {
+		ar, err := doAuth(base, k)
+		if err == nil {
+			return ar, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+func cmdKeygen() {
+	dir := rshDir()
+	os.MkdirAll(dir, 0o700)
+	path := filepath.Join(dir, "id")
+	if _, err := os.Stat(path); err == nil {
+		fmt.Fprintf(os.Stderr, "already exists: %s\n", path)
+		os.Exit(1)
+	}
+	cmd := exec.Command(sshKeygenPath(), "-t", "ed25519", "-N", "", "-C", "rsh-auth", "-f", path, "-q")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		fmt.Fprintf(os.Stderr, "keygen: %v %s\n", err, string(out))
+		os.Exit(1)
+	}
+	pub, _ := os.ReadFile(path + ".pub")
+	fmt.Printf("generated %s\n", path)
+	fmt.Printf("public key (register with `rsh admin add`):\n%s", string(pub))
+}
+
+func getJWT(base, needRole string) (string, error) {
+	ar, err := authenticate()
+	if err != nil {
+		return "", err
+	}
+	if needRole != "" && ar.Role != needRole {
+		return "", fmt.Errorf("this key has role %q, need %q", ar.Role, needRole)
+	}
+	return ar.Token, nil
+}
+
+func apiPost(base, path, token string, payload interface{}) (int, []byte, error) {
+	body, _ := json.Marshal(payload)
+	req, _ := http.NewRequest("POST", base+path, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, b, nil
+}
+
+func apiDo(base, method, path, token string) (int, []byte, error) {
+	req, _ := http.NewRequest(method, base+path, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, b, nil
+}
+
+func cmdAdminAdd(base string, args []string) {
+	var pub, role, hosts, label string
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--key":
+			i++
+			pub = args[i]
+		case "--role":
+			i++
+			role = args[i]
+		case "--hosts":
+			i++
+			hosts = args[i]
+		case "--label":
+			i++
+			label = args[i]
+		}
+	}
+	if pub == "" {
+		b, _ := io.ReadAll(os.Stdin)
+		pub = strings.TrimSpace(string(b))
+	}
+	if role == "" {
+		role = "user"
+	}
+	token, err := getJWT(base, "admin")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "admin auth: %v\n", err)
+		os.Exit(1)
+	}
+	payload := map[string]interface{}{
+		"pubkey": strings.TrimSpace(pub),
+		"role":   role,
+		"label":  label,
+	}
+	if hosts != "" {
+		payload["hosts"] = strings.Split(hosts, ",")
+	}
+	code, b, err := apiPost(base, "/v1/admin/keys", token, payload)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "request: %v\n", err)
+		os.Exit(1)
+	}
+	if code != 200 {
+		fmt.Fprintf(os.Stderr, "add failed (%d): %s\n", code, strings.TrimSpace(string(b)))
+		os.Exit(1)
+	}
+	fmt.Printf("added: %s\n", strings.TrimSpace(string(b)))
+}
+
+func cmdAdminList(base string) {
+	token, err := getJWT(base, "admin")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "admin auth: %v\n", err)
+		os.Exit(1)
+	}
+	code, b, err := apiDo(base, "GET", "/v1/admin/keys", token)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "request: %v\n", err)
+		os.Exit(1)
+	}
+	if code != 200 {
+		fmt.Fprintf(os.Stderr, "list failed (%d): %s\n", code, strings.TrimSpace(string(b)))
+		os.Exit(1)
+	}
+	var keys []struct {
+		ID     string   `json:"id"`
+		Pubkey string   `json:"pubkey"`
+		Role   string   `json:"role"`
+		Hosts  []string `json:"hosts"`
+		Label  string   `json:"label"`
+	}
+	json.Unmarshal(b, &keys)
+	fmt.Printf("%-10s %-6s %-20s %-15s %s\n", "ID", "ROLE", "LABEL", "HOSTS", "PUBKEY")
+	for _, k := range keys {
+		pk := k.Pubkey
+		if parts := strings.Fields(pk); len(parts) >= 2 {
+			pk = parts[1][:20] + "..."
+		}
+		fmt.Printf("%-10s %-6s %-20s %-15s %s\n", k.ID, k.Role, k.Label, strings.Join(k.Hosts, ","), pk)
+	}
+}
+
+func cmdAdminRm(base string, args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: rsh admin rm <id>")
+		os.Exit(1)
+	}
+	token, err := getJWT(base, "admin")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "admin auth: %v\n", err)
+		os.Exit(1)
+	}
+	code, b, err := apiDo(base, "DELETE", "/v1/admin/keys/"+args[0], token)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "request: %v\n", err)
+		os.Exit(1)
+	}
+	if code != 200 {
+		fmt.Fprintf(os.Stderr, "rm failed (%d): %s\n", code, strings.TrimSpace(string(b)))
+		os.Exit(1)
+	}
+	fmt.Printf("deleted %s\n", args[0])
+}
+
+func knownHostsFile() string {
+	return filepath.Join(rshDir(), "known_hosts")
+}
+
+func ensureKeyFile(name, content string) (string, error) {
+	dir := filepath.Join(rshDir(), "ssh")
+	os.MkdirAll(dir, 0o700)
+	p := filepath.Join(dir, name)
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		return "", err
+	}
+	return p, nil
+}
+
+func connect(base, target string) {
+	ar, err := authenticate()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "auth: %v\n", err)
+		os.Exit(1)
+	}
+	if ar.Role != "admin" {
+		fmt.Fprintf(os.Stderr, "access denied: role %q cannot open SSH sessions\n", ar.Role)
+		os.Exit(1)
+	}
+
+	var host string
+	if target != "" {
+		found := false
+		for _, h := range ar.Hosts {
+			if h == target {
+				found = true
+				break
+			}
+		}
+		if !found {
+			fmt.Fprintf(os.Stderr, "host %q not available for this key (allowed: %s)\n", target, strings.Join(ar.Hosts, ", "))
+			os.Exit(1)
+		}
+		host = target
+	} else {
+		if len(ar.Hosts) == 0 {
+			fmt.Fprintln(os.Stderr, "no hosts available")
+			os.Exit(1)
+		}
+		fmt.Fprintln(os.Stderr, "available servers:")
+		for i, h := range ar.Hosts {
+			fmt.Fprintf(os.Stderr, "  %d) %s\n", i+1, h)
+		}
+		fmt.Fprint(os.Stderr, "select: ")
+		var in string
+		fmt.Scanln(&in)
+		n, err := strconv.Atoi(strings.TrimSpace(in))
+		if err != nil || n < 1 || n > len(ar.Hosts) {
+			fmt.Fprintln(os.Stderr, "invalid selection")
+			os.Exit(1)
+		}
+		host = ar.Hosts[n-1]
+	}
+
+	code, b, err := apiPost(base, "/v1/sshkey", ar.Token, map[string]string{"host": host})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sshkey: %v\n", err)
+		os.Exit(1)
+	}
+	if code != 200 {
+		fmt.Fprintf(os.Stderr, "sshkey failed (%d): %s\n", code, strings.TrimSpace(string(b)))
+		os.Exit(1)
+	}
+	var sk sshKeyResp
+	if err := json.Unmarshal(b, &sk); err != nil {
+		fmt.Fprintf(os.Stderr, "parse: %v\n", err)
+		os.Exit(1)
+	}
+
+	targetKeyFile, err := ensureKeyFile(host, sk.PrivateKey)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "write key: %v\n", err)
+		os.Exit(1)
+	}
+
+	kh := knownHostsFile()
+	sshArgs := []string{
+		"-i", targetKeyFile,
+		"-o", "IdentitiesOnly=yes",
+		"-o", "UserKnownHostsFile=" + kh,
+		"-o", "StrictHostKeyChecking=accept-new",
+		"-o", "ServerAliveInterval=30",
+		"-o", "ServerAliveCountMax=3",
+	}
+
+	if sk.Jump != nil {
+		jumpKeyFile, err := ensureKeyFile(host+"-jump", sk.Jump.PrivateKey)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "write jump key: %v\n", err)
+			os.Exit(1)
+		}
+		proxy := fmt.Sprintf("ssh -i %s -o IdentitiesOnly=yes -o UserKnownHostsFile=%s -o StrictHostKeyChecking=accept-new -W %%h:%%p %s@%s -p %d",
+			jumpKeyFile, kh, sk.Jump.User, sk.Jump.Addr, sk.Jump.Port)
+		sshArgs = append(sshArgs, "-o", "ProxyCommand="+proxy)
+	}
+
+	sshArgs = append(sshArgs, "-p", strconv.Itoa(sk.Port), fmt.Sprintf("%s@%s", sk.User, sk.Addr))
+
+	if os.Getenv("RSH_DUMP") == "1" {
+		fmt.Fprintln(os.Stderr, "ssh "+strings.Join(sshArgs, " "))
+		return
+	}
+
+	sshBin, err := lookPath("ssh")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "ssh not found in PATH")
+		os.Exit(1)
+	}
+	argv := append([]string{"ssh"}, sshArgs...)
+	syscall.Exec(sshBin, argv, os.Environ())
+}
+
+const (
+	netMagicDiscover = "RIVAL-DISCOVER v1"
+	netMagicHello    = "RIVAL-HELLO"
+	netDefaultPort   = 47800
+)
+
+func isPrivateIPv4(ip net.IP) bool {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return false
+	}
+	return ip4[0] == 10 ||
+		(ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31) ||
+		(ip4[0] == 192 && ip4[1] == 168)
+}
+
+// netIface is a parsed network interface (from net.Interfaces or ifconfig).
+type netIface struct {
+	name  string
+	ip    net.IP
+	mask  net.IPMask
+	bcast net.IP
+	up    bool
+	loop  bool
+}
+
+// ifaces returns network interfaces. It first tries net.Interfaces(); on
+// Android that fails with "netlinkrib: permission denied", so it falls back
+// to parsing `ifconfig` output (which still works unprivileged).
+func ifaces() []netIface {
+	var out []netIface
+	if ifs, err := net.Interfaces(); err == nil {
+		for _, iface := range ifs {
+			addrs, _ := iface.Addrs()
+			for _, a := range addrs {
+				ipnet, ok := a.(*net.IPNet)
+				if !ok || ipnet.IP == nil {
+					continue
+				}
+				ip4 := ipnet.IP.To4()
+				if ip4 == nil {
+					continue
+				}
+				mask := ipnet.Mask
+				var bcast net.IP
+				if len(mask) == net.IPv4len {
+					bcast = make(net.IP, net.IPv4len)
+					for i := 0; i < net.IPv4len; i++ {
+						bcast[i] = ip4[i] | ^mask[i]
+					}
+				}
+				out = append(out, netIface{
+					name: iface.Name, ip: ip4, mask: mask, bcast: bcast,
+					up: iface.Flags&net.FlagUp != 0, loop: iface.Flags&net.FlagLoopback != 0,
+				})
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	return ifacesFromIfconfig()
+}
+
+// ifacesFromIfconfig parses `ifconfig` output. Resolves the binary via the
+// custom lookPath so exec.Command does not trigger faccessat2 (Android
+// seccomp -> SIGSYS).
+func ifacesFromIfconfig() []netIface {
+	bin, err := lookPath("ifconfig")
+	if err != nil {
+		return nil
+	}
+	b, err := exec.Command(bin).Output()
+	if err != nil {
+		return nil
+	}
+	var out []netIface
+	var cur *netIface
+	for _, line := range strings.Split(string(b), "\n") {
+		trimmed := strings.TrimSpace(line)
+		// New interface header: "wlan0: flags=...". Indented lines belong to it.
+		if !strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "\t") && strings.Contains(trimmed, ":") {
+			name := strings.SplitN(trimmed, ":", 2)[0]
+			fields := strings.Fields(trimmed)
+			up := false
+			loop := false
+			for _, f := range fields {
+				if strings.Contains(f, "UP") {
+					up = true
+				}
+				if strings.Contains(f, "LOOPBACK") {
+					loop = true
+				}
+			}
+			out = append(out, netIface{name: name, up: up, loop: loop})
+			cur = &out[len(out)-1]
+			continue
+		}
+		if cur == nil {
+			continue
+		}
+		// "inet 192.168.0.128  netmask 255.255.255.0  broadcast 192.168.0.255"
+		if strings.Contains(trimmed, "inet ") && !strings.Contains(trimmed, "inet6") {
+			f := strings.Fields(trimmed)
+			for i := 0; i < len(f); i++ {
+				switch f[i] {
+				case "inet":
+					if i+1 < len(f) {
+						if ip4 := net.ParseIP(f[i+1]).To4(); ip4 != nil {
+							cur.ip = ip4
+						}
+					}
+				case "netmask":
+					if i+1 < len(f) {
+						if m := net.ParseIP(f[i+1]).To4(); m != nil {
+							cur.mask = net.IPMask(m)
+						}
+					}
+				case "broadcast":
+					if i+1 < len(f) {
+						if b := net.ParseIP(f[i+1]).To4(); b != nil {
+							cur.bcast = b
+						}
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
+// localIPv4s returns all non-loopback private IPv4 addresses, preferring
+// 192.168/16 then 172.16/12 then 10/8 (WiFi/LAN over cellular).
+func localIPv4s() []net.IP {
+	var pref192, pref172, pref10 []net.IP
+	for _, iface := range ifaces() {
+		if !iface.up || iface.loop || iface.ip == nil || !isPrivateIPv4(iface.ip) {
+			continue
+		}
+		switch {
+		case iface.ip[0] == 192:
+			pref192 = append(pref192, iface.ip)
+		case iface.ip[0] == 172:
+			pref172 = append(pref172, iface.ip)
+		case iface.ip[0] == 10:
+			pref10 = append(pref10, iface.ip)
+		}
+	}
+	return append(append(pref192, pref172...), pref10...)
+}
+
+func detectLocalIP() net.IP {
+	ips := localIPv4s()
+	if len(ips) == 0 {
+		return nil
+	}
+	return ips[0]
+}
+
+// subnetBroadcast returns the IPv4 broadcast address for an interface IP,
+// falling back to the limited broadcast (255.255.255.255).
+func subnetBroadcast(ip net.IP) net.IP {
+	for _, iface := range ifaces() {
+		if iface.ip != nil && iface.ip.Equal(ip) && iface.bcast != nil {
+			return iface.bcast
+		}
+	}
+	return net.IPv4bcast
+}
+
+func netServe(label string, port int) error {
+	if label == "" {
+		label = "device"
+	}
+	addr := &net.UDPAddr{IP: net.IPv4zero, Port: port}
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	fmt.Fprintf(os.Stderr, "rival-net responder listening on udp/%d as %q\n", port, label)
+	buf := make([]byte, 512)
+	for {
+		n, raddr, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			continue
+		}
+		msg := strings.TrimSpace(string(buf[:n]))
+		if msg != netMagicDiscover {
+			continue
+		}
+		resp := netMagicHello + " " + label
+		conn.WriteToUDP([]byte(resp), raddr)
+	}
+}
+
+func netDiscover(port int, timeout time.Duration) (map[string]string, error) {
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	// broadcast to each local subnet + limited broadcast
+	targets := []net.IP{net.IPv4bcast}
+	for _, ip := range localIPv4s() {
+		if b := subnetBroadcast(ip); b != nil {
+			targets = append(targets, b)
+		}
+	}
+	for _, t := range targets {
+		conn.WriteToUDP([]byte(netMagicDiscover), &net.UDPAddr{IP: t, Port: port})
+	}
+	found := map[string]string{}
+	deadline := time.Now().Add(timeout)
+	conn.SetReadDeadline(deadline)
+	buf := make([]byte, 512)
+	for {
+		n, raddr, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			break // timeout
+		}
+		msg := strings.TrimSpace(string(buf[:n]))
+		if !strings.HasPrefix(msg, netMagicHello) {
+			continue
+		}
+		label := strings.TrimSpace(strings.TrimPrefix(msg, netMagicHello))
+		if label == "" {
+			label = "device"
+		}
+		if ip4 := raddr.IP.To4(); ip4 != nil {
+			found[label] = ip4.String()
+		}
+	}
+	return found, nil
+}
+
+func netTokenHTTP(method, url string, body []byte) (int, []byte, error) {
+	var rdr io.Reader
+	if body != nil {
+		rdr = bytes.NewReader(body)
+	}
+	req, _ := http.NewRequest(method, url, rdr)
+	req.Header.Set("Authorization", "Bearer "+netToken())
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, b, nil
+}
+
+func cmdNet(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: rsh net <ip|serve|discover|announce|find> ...")
+		os.Exit(1)
+	}
+	base := authURL()
+	switch args[0] {
+	case "ip":
+		ip := detectLocalIP()
+		if ip == nil {
+			fmt.Fprintln(os.Stderr, "no private IPv4 found")
+			os.Exit(1)
+		}
+		fmt.Println(ip.String())
+	case "serve":
+		label := ""
+		port := netDefaultPort
+		for i := 1; i < len(args); i++ {
+			switch args[i] {
+			case "--label":
+				i++
+				label = args[i]
+			case "--port":
+				i++
+				port, _ = strconv.Atoi(args[i])
+			}
+		}
+		if label == "" {
+			if h, err := os.Hostname(); err == nil {
+				label = h
+			}
+		}
+		if err := netServe(label, port); err != nil {
+			fmt.Fprintf(os.Stderr, "serve: %v\n", err)
+			os.Exit(1)
+		}
+	case "discover":
+		port := netDefaultPort
+		timeout := 3 * time.Second
+		for i := 1; i < len(args); i++ {
+			switch args[i] {
+			case "--port":
+				i++
+				port, _ = strconv.Atoi(args[i])
+			case "--timeout":
+				i++
+				ms, _ := strconv.Atoi(args[i])
+				timeout = time.Duration(ms) * time.Second
+			}
+		}
+		found, err := netDiscover(port, timeout)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "discover: %v\n", err)
+			os.Exit(1)
+		}
+		json.NewEncoder(os.Stdout).Encode(found)
+	case "announce":
+		label := ""
+		for i := 1; i < len(args); i++ {
+			if args[i] == "--label" {
+				i++
+				label = args[i]
+			}
+		}
+		if label == "" {
+			if h, err := os.Hostname(); err == nil {
+				label = h
+			} else {
+				label = "device"
+			}
+		}
+		ip := detectLocalIP()
+		if ip == nil {
+			fmt.Fprintln(os.Stderr, "no private IPv4 to announce")
+			os.Exit(1)
+		}
+		peers, _ := netDiscover(netDefaultPort, 2*time.Second)
+		payload, _ := json.Marshal(map[string]interface{}{
+			"label": label,
+			"ip":    ip.String(),
+			"peers": peers,
+		})
+		code, b, err := netTokenHTTP("POST", base+"/v1/net/announce", payload)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "announce: %v\n", err)
+			os.Exit(1)
+		}
+		if code != 200 {
+			fmt.Fprintf(os.Stderr, "announce failed (%d): %s\n", code, strings.TrimSpace(string(b)))
+			os.Exit(1)
+		}
+		fmt.Printf("announced %s=%s (peers: %d)\n", label, ip.String(), len(peers))
+	case "find":
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "usage: rsh net find <label>")
+			os.Exit(1)
+		}
+		ip := findPeer(base, args[1])
+		if ip == "" {
+			fmt.Fprintf(os.Stderr, "find: unknown peer %s\n", args[1])
+			os.Exit(1)
+		}
+		fmt.Println(ip)
+	case "resolve":
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "usage: rsh net resolve <label> [--timeout S]")
+			os.Exit(1)
+		}
+		label := args[1]
+		timeout := 3 * time.Second
+		for i := 2; i < len(args); i++ {
+			if args[i] == "--timeout" {
+				i++
+				ms, _ := strconv.Atoi(args[i])
+				timeout = time.Duration(ms) * time.Second
+			}
+		}
+		// 1. UDP broadcast discovery (same LAN, no auth needed)
+		if found, err := netDiscover(netDefaultPort, timeout); err == nil {
+			if ip := found[label]; ip != "" {
+				fmt.Println(ip)
+				return
+			}
+		}
+		// 2. query auth (last announced IP)
+		if ip := findPeer(base, label); ip != "" {
+			fmt.Println(ip)
+			return
+		}
+		// 3. local override file ~/.rsh/<label>_ip
+		if b, err := os.ReadFile(filepath.Join(rshDir(), label+"_ip")); err == nil {
+			if ip := strings.TrimSpace(string(b)); ip != "" {
+				fmt.Println(ip)
+				return
+			}
+		}
+		fmt.Fprintf(os.Stderr, "resolve: cannot determine %s ip\n", label)
+		os.Exit(1)
+	default:
+		fmt.Fprintln(os.Stderr, "usage: rsh net <ip|serve|discover|announce|find|resolve> ...")
+		os.Exit(1)
+	}
+}
+
+func findPeer(base, label string) string {
+	code, b, err := netTokenHTTP("GET", base+"/v1/net/peer/"+label, nil)
+	if err != nil || code != 200 {
+		return ""
+	}
+	var peer struct {
+		IP string `json:"ip"`
+	}
+	json.Unmarshal(b, &peer)
+	return peer.IP
+}
+
+func usage() {
+	fmt.Fprintf(os.Stderr, `rsh - rival ssh gateway
+
+usage:
+  rsh                     interactive server picker + connect
+  rsh <host>              connect to a host (vps/phone/pc)
+  rsh keygen              generate auth keypair in ~/.rsh/
+  rsh admin add           register a pubkey (needs admin key)
+      --key "<pubkey>" --role user|admin [--hosts vps,phone,pc] [--label name]
+  rsh admin list          list registered keys
+  rsh admin rm <id>       remove a key
+  rsh net ip              print this device's LAN IPv4
+  rsh net serve           run UDP broadcast responder (--label, --port)
+  rsh net discover        broadcast-probe the LAN, print {label:ip} (--port, --timeout)
+  rsh net announce        report own LAN IP (+discovered peers) to auth (--label)
+  rsh net find <label>    query auth for a peer's current LAN IP
+  rsh net resolve <label> print a peer's IP: discover -> find -> override file
+
+auth endpoint: %s (override: RSH_AUTH_URL or ~/.rsh/config.json auth_url)
+`, authURL())
+}
+
+func main() {
+	base := authURL()
+	args := os.Args[1:]
+	if len(args) == 0 {
+		connect(base, "")
+		return
+	}
+	switch args[0] {
+	case "keygen":
+		cmdKeygen()
+	case "admin":
+		if len(args) < 2 {
+			usage()
+			os.Exit(1)
+		}
+		switch args[1] {
+		case "add":
+			cmdAdminAdd(base, args[2:])
+		case "list":
+			cmdAdminList(base)
+		case "rm":
+			cmdAdminRm(base, args[2:])
+		default:
+			usage()
+			os.Exit(1)
+		}
+	case "net":
+		cmdNet(args[1:])
+	case "help", "-h", "--help":
+		usage()
+	default:
+		connect(base, args[0])
+	}
+}

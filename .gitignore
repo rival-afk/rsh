@@ -1,0 +1,4 @@
+# build artifacts
+rsh-linux-amd64
+rsh-linux-arm64
+rsh-*
