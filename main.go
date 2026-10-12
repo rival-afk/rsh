@@ -109,8 +109,9 @@ func authURL() string {
 }
 
 type rshConfig struct {
-	AuthURL  string `json:"auth_url"`
-	NetToken string `json:"net_token"`
+	AuthURL  string            `json:"auth_url"`
+	NetToken string            `json:"net_token"`
+	WoL      map[string]string `json:"wol"`
 }
 
 func loadRshConfig() rshConfig {
@@ -552,6 +553,197 @@ func connect(base, target string) {
 	syscall.Exec(sshBin, argv, os.Environ())
 }
 
+// sshRun mirrors connect() but runs a single remote command (non-interactive),
+// reusing the same auth + provisioned key + jump (VPS tunnel) path.
+func sshRun(base, target, remoteCmd string) {
+	ar, err := authenticate()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "auth: %v\n", err)
+		os.Exit(1)
+	}
+	if ar.Role != "admin" {
+		fmt.Fprintf(os.Stderr, "access denied: role %q cannot run commands\n", ar.Role)
+		os.Exit(1)
+	}
+	host := target
+	found := false
+	for _, h := range ar.Hosts {
+		if h == target {
+			found = true
+			break
+		}
+	}
+	if !found {
+		fmt.Fprintf(os.Stderr, "host %q not available (allowed: %s)\n", target, strings.Join(ar.Hosts, ", "))
+		os.Exit(1)
+	}
+	code, b, err := apiPost(base, "/v1/sshkey", ar.Token, map[string]string{"host": host})
+	if err != nil || code != 200 {
+		fmt.Fprintf(os.Stderr, "sshkey failed: %v %s\n", err, strings.TrimSpace(string(b)))
+		os.Exit(1)
+	}
+	var sk sshKeyResp
+	if err := json.Unmarshal(b, &sk); err != nil {
+		fmt.Fprintf(os.Stderr, "parse: %v\n", err)
+		os.Exit(1)
+	}
+	targetKeyFile, err := ensureKeyFile(host, sk.PrivateKey)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "write key: %v\n", err)
+		os.Exit(1)
+	}
+	kh := knownHostsFile()
+	args := []string{
+		"-i", targetKeyFile,
+		"-o", "IdentitiesOnly=yes",
+		"-o", "UserKnownHostsFile=" + kh,
+		"-o", "StrictHostKeyChecking=accept-new",
+		"-o", "ConnectTimeout=15",
+		"-o", "ServerAliveInterval=20",
+		"-o", "ServerAliveCountMax=3",
+	}
+	if sk.Jump != nil {
+		jumpKeyFile, err := ensureKeyFile(host+"-jump", sk.Jump.PrivateKey)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "write jump key: %v\n", err)
+			os.Exit(1)
+		}
+		proxy := fmt.Sprintf("ssh -i %s -o IdentitiesOnly=yes -o UserKnownHostsFile=%s -o StrictHostKeyChecking=accept-new -W %%h:%%p %s@%s -p %d",
+			jumpKeyFile, kh, sk.Jump.User, sk.Jump.Addr, sk.Jump.Port)
+		args = append(args, "-o", "ProxyCommand="+proxy)
+	}
+	args = append(args, "-p", strconv.Itoa(sk.Port), fmt.Sprintf("%s@%s", sk.User, sk.Addr))
+	args = append(args, remoteCmd)
+	sshBin, err := lookPath("ssh")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "ssh not found in PATH")
+		os.Exit(1)
+	}
+	out, err := exec.Command(sshBin, args...).CombinedOutput()
+	fmt.Print(string(out))
+	if err != nil {
+		os.Exit(1)
+	}
+}
+
+// parseMAC accepts "fc:9d:05:23:95:fa" and returns 6 bytes.
+func parseMAC(s string) ([]byte, error) {
+	s = strings.ReplaceAll(s, "-", ":")
+	parts := strings.Split(s, ":")
+	if len(parts) != 6 {
+		return nil, fmt.Errorf("bad MAC %q", s)
+	}
+	b := make([]byte, 6)
+	for i, p := range parts {
+		v, err := strconv.ParseUint(p, 16, 8)
+		if err != nil {
+			return nil, fmt.Errorf("bad MAC octet %q", p)
+		}
+		b[i] = byte(v)
+	}
+	return b, nil
+}
+
+// sendWOL sends Wake-on-LAN magic packets (6x 0xFF + 16x MAC) to broadcasts.
+func sendWOL(mac string, port int) error {
+	m, err := parseMAC(mac)
+	if err != nil {
+		return err
+	}
+	pkt := append(bytes.Repeat([]byte{0xFF}, 6), bytes.Repeat(m, 16)...)
+	// limited + subnet broadcasts
+	targets := []string{"255.255.255.255"}
+	for _, ip := range localIPv4s() {
+		if b := subnetBroadcast(ip); b != nil {
+			targets = append(targets, b.String())
+		}
+	}
+	seen := map[string]bool{}
+	for _, t := range targets {
+		if seen[t] {
+			continue
+		}
+		seen[t] = true
+		conn, err := net.Dial("udp", net.JoinHostPort(t, strconv.Itoa(port)))
+		if err != nil {
+			continue
+		}
+		conn.Write(pkt)
+		conn.Close()
+	}
+	return nil
+}
+
+func wolMAC(arg string) string {
+	// explicit MAC if it has 5 separators and hex
+	if _, err := parseMAC(arg); err == nil {
+		return arg
+	}
+	if m := loadRshConfig().WoL[arg]; m != "" {
+		return m
+	}
+	return ""
+}
+
+func cmdWOL(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: rsh wol <mac|label> [--port 9]")
+		os.Exit(1)
+	}
+	port := 9
+	for i := 1; i < len(args); i++ {
+		if args[i] == "--port" && i+1 < len(args) {
+			i++
+			port, _ = strconv.Atoi(args[i])
+		}
+	}
+	mac := wolMAC(args[0])
+	if mac == "" {
+		fmt.Fprintf(os.Stderr, "wol: unknown mac/label %q (configure in ~/.rsh/config.json \"wol\":{\"%s\":\"aa:bb:..\"})\n", args[0], args[0])
+		os.Exit(1)
+	}
+	if err := sendWOL(mac, port); err != nil {
+		fmt.Fprintf(os.Stderr, "wol: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("sent WoL magic packet to %s (port %d)\n", mac, port)
+}
+
+func cmdPC(base string, args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: rsh pc <on|off|reboot|status|exec ...>")
+		os.Exit(1)
+	}
+	switch args[0] {
+	case "on":
+		mac := loadRshConfig().WoL["pc"]
+		if mac == "" {
+			fmt.Fprintln(os.Stderr, "rsh pc on: no WoL MAC configured for 'pc' (see ~/.rsh/config.json \"wol\":{\"pc\":\"...\"})")
+			os.Exit(1)
+		}
+		if err := sendWOL(mac, 9); err != nil {
+			fmt.Fprintf(os.Stderr, "wol: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("wake-on-LAN sent to pc (%s)\n", mac)
+	case "off":
+		sshRun(base, "pc", "systemctl poweroff")
+	case "reboot":
+		sshRun(base, "pc", "systemctl reboot")
+	case "status":
+		sshRun(base, "pc", "echo ON; hostname; uptime -p 2>/dev/null; systemctl is-active sshd; ")
+	case "exec":
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "usage: rsh pc exec <command>")
+			os.Exit(1)
+		}
+		sshRun(base, "pc", strings.Join(args[1:], " "))
+	default:
+		fmt.Fprintln(os.Stderr, "usage: rsh pc <on|off|reboot|status|exec ...>")
+		os.Exit(1)
+	}
+}
+
 const (
 	netMagicDiscover = "RIVAL-DISCOVER v1"
 	netMagicHello    = "RIVAL-HELLO"
@@ -980,6 +1172,11 @@ usage:
   rsh net announce        report own LAN IP (+discovered peers) to auth (--label)
   rsh net find <label>    query auth for a peer's current LAN IP
   rsh net resolve <label> print a peer's IP: discover -> find -> override file
+  rsh wol <mac|label>  send Wake-on-LAN magic packet (--port 9)
+  rsh pc on            send WoL to the PC (label 'pc' in config.wol)
+  rsh pc off|reboot    power off / reboot the PC (via ssh)
+  rsh pc status        print PC online? / uptime / sshd via ssh
+  rsh pc exec <cmd>    run a command on the PC via ssh
 
 auth endpoint: %s (override: RSH_AUTH_URL or ~/.rsh/config.json auth_url)
 `, authURL())
@@ -1013,6 +1210,10 @@ func main() {
 		}
 	case "net":
 		cmdNet(args[1:])
+	case "wol":
+		cmdWOL(args[1:])
+	case "pc":
+		cmdPC(base, args[1:])
 	case "help", "-h", "--help":
 		usage()
 	default:
