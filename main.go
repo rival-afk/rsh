@@ -727,11 +727,11 @@ func cmdPC(base string, args []string) {
 		}
 		fmt.Printf("wake-on-LAN sent to pc (%s)\n", mac)
 	case "off":
-		sshRun(base, "pc", "systemctl poweroff")
+		sshRun(base, "pc", `systemctl poweroff 2>/dev/null || poweroff`)
 	case "reboot":
-		sshRun(base, "pc", "systemctl reboot")
+		sshRun(base, "pc", `systemctl reboot 2>/dev/null || reboot`)
 	case "status":
-		sshRun(base, "pc", "echo ON; hostname; uptime -p 2>/dev/null; systemctl is-active sshd; ")
+		sshRun(base, "pc", `echo ON; hostname; uptime -p 2>/dev/null || uptime; if command -v systemctl >/dev/null 2>&1; then systemctl is-active sshd; else rc-service sshd status; fi; true`)
 	case "exec":
 		if len(args) < 2 {
 			fmt.Fprintln(os.Stderr, "usage: rsh pc exec <command>")
