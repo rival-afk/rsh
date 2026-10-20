@@ -1,15 +1,18 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,6 +22,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/sys/unix"
 )
 
 // isExecutable reports whether path is a regular executable file.
@@ -294,12 +298,165 @@ func cmdKeygen() {
 	fmt.Printf("public key (register with `rsh admin add`):\n%s", string(pub))
 }
 
+func readPassword(prompt string) (string, error) {
+	fmt.Fprint(os.Stderr, prompt)
+	fd := int(os.Stdin.Fd())
+	old, err := unix.IoctlGetTermios(fd, unix.TCGETS)
+	if err != nil {
+		r := bufio.NewReader(os.Stdin)
+		l, _ := r.ReadString('\n')
+		return strings.TrimSpace(l), nil
+	}
+	noecho := *old
+	noecho.Lflag &^= unix.ECHO
+	if err := unix.IoctlSetTermios(fd, unix.TCSETS, &noecho); err != nil {
+		r := bufio.NewReader(os.Stdin)
+		l, _ := r.ReadString('\n')
+		return strings.TrimSpace(l), nil
+	}
+	defer unix.IoctlSetTermios(fd, unix.TCSETS, old)
+	r := bufio.NewReader(os.Stdin)
+	l, err := r.ReadString('\n')
+	fmt.Fprintln(os.Stderr)
+	return strings.TrimRight(l, "\r\n"), err
+}
+
+func webPost(c *http.Client, base, path, token string, payload interface{}) (int, []byte, error) {
+	var rdr io.Reader
+	if payload != nil {
+		body, _ := json.Marshal(payload)
+		rdr = bytes.NewReader(body)
+	}
+	req, err := http.NewRequest("POST", base+path, rdr)
+	if err != nil {
+		return 0, nil, err
+	}
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := c.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, b, nil
+}
+
+func cmdLogin() {
+	cmdLoginFlow(false)
+}
+
+func cmdRegister() {
+	cmdLoginFlow(true)
+}
+
+func cmdLoginFlow(reg bool) {
+	base := authURL()
+	jar, _ := cookiejar.New(nil)
+	c := &http.Client{Timeout: 20 * time.Second, Transport: authClient.Transport, Jar: jar}
+	fmt.Fprint(os.Stderr, "username: ")
+	un, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	un = strings.ToLower(strings.TrimSpace(un))
+	pw, _ := readPassword("password: ")
+	if un == "" || pw == "" {
+		fmt.Fprintln(os.Stderr, "username and password required")
+		os.Exit(1)
+	}
+	path := "/v1/web/passlogin"
+	if reg {
+		path = "/v1/web/register"
+	}
+	code, b, err := webPost(c, base, path, "", map[string]string{"username": un, "password": pw})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "login: %v\n", err)
+		os.Exit(1)
+	}
+	var pr struct {
+		Error   string `json:"error"`
+		Message string `json:"message"`
+		Token   string `json:"token"`
+	}
+	json.Unmarshal(b, &pr)
+	if pr.Error != "" || code != 200 {
+		fmt.Fprintf(os.Stderr, "%s (%d)\n", strings.TrimSpace(pr.Error), code)
+		os.Exit(1)
+	}
+	if reg {
+		fmt.Println(pr.Message)
+		os.Exit(0)
+	}
+	fmt.Println("login ok, binding ~/.rsh key…")
+
+	keys, err := loadAuthKeys()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "key: %v\n", err)
+		os.Exit(1)
+	}
+	code, b, err = webPost(c, base, "/v1/web/bindnonce", pr.Token, nil)
+	if err != nil || code != 200 {
+		fmt.Fprintf(os.Stderr, "bindnonce: %v (%d) %s\n", err, code, strings.TrimSpace(string(b)))
+		os.Exit(1)
+	}
+	var bn struct {
+		Nonce string `json:"nonce"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(b, &bn); err != nil || bn.Error != "" || bn.Nonce == "" {
+		fmt.Fprintf(os.Stderr, "bindnonce: %v %s\n", err, bn.Error)
+		os.Exit(1)
+	}
+	msg := fmt.Sprintf("rival-web-v1|%s", bn.Nonce)
+	sig := ed25519.Sign(keys[0].priv, []byte(msg))
+	f := strings.Fields(keys[0].pub)
+	pk := keys[0].pub
+	if len(f) >= 2 {
+		pk = f[0] + " " + f[1]
+	}
+	code, b, err = webPost(c, base, "/v1/web/bindkey", pr.Token, map[string]string{
+		"pubkey": pk,
+		"nonce":  bn.Nonce,
+		"sig":    base64.StdEncoding.EncodeToString(sig),
+	})
+	if err != nil || code != 200 {
+		fmt.Fprintf(os.Stderr, "bindkey: %v (%d) %s\n", err, code, strings.TrimSpace(string(b)))
+		os.Exit(1)
+	}
+	var bk struct {
+		Error   string `json:"error"`
+		Message string `json:"message"`
+	}
+	json.Unmarshal(b, &bk)
+	if bk.Error != "" {
+		fmt.Fprintf(os.Stderr, "bindkey: %s\n", bk.Error)
+		os.Exit(1)
+	}
+	fmt.Println("key bound: " + pk)
+	if ar, err := authenticate(); err == nil {
+		fmt.Printf("role: %s, hosts: %s\n", ar.Role, strings.Join(ar.Hosts, ", "))
+	}
+	fmt.Println("now run: rsh")
+}
+
+func isPrivileged(role string) bool {
+	return role == "admin" || role == "owner"
+}
+
 func getJWT(base, needRole string) (string, error) {
 	ar, err := authenticate()
 	if err != nil {
 		return "", err
 	}
-	if needRole != "" && ar.Role != needRole {
+	if needRole == "admin" {
+		needRole = "$privileged"
+	}
+	if needRole == "$privileged" && !isPrivileged(ar.Role) {
+		return "", fmt.Errorf("this key has role %q, need admin/owner", ar.Role)
+	}
+	if needRole != "" && needRole != "$privileged" && ar.Role != needRole {
 		return "", fmt.Errorf("this key has role %q, need %q", ar.Role, needRole)
 	}
 	return ar.Token, nil
@@ -456,7 +613,7 @@ func connect(base, target string) {
 		fmt.Fprintf(os.Stderr, "auth: %v\n", err)
 		os.Exit(1)
 	}
-	if ar.Role != "admin" {
+	if !isPrivileged(ar.Role) {
 		fmt.Fprintf(os.Stderr, "access denied: role %q cannot open SSH sessions\n", ar.Role)
 		os.Exit(1)
 	}
@@ -561,7 +718,7 @@ func sshRun(base, target, remoteCmd string) {
 		fmt.Fprintf(os.Stderr, "auth: %v\n", err)
 		os.Exit(1)
 	}
-	if ar.Role != "admin" {
+	if !isPrivileged(ar.Role) {
 		fmt.Fprintf(os.Stderr, "access denied: role %q cannot run commands\n", ar.Role)
 		os.Exit(1)
 	}
@@ -1162,6 +1319,8 @@ usage:
   rsh                     interactive server picker + connect
   rsh <host>              connect to a host (vps/phone/pc)
   rsh keygen              generate auth keypair in ~/.rsh/
+  rsh login               password login (auth.rival-afk.com) + bind ~/.rsh key
+  rsh register            create account on auth server (waits for admin approval)
   rsh admin add           register a pubkey (needs admin key)
       --key "<pubkey>" --role user|admin [--hosts vps,phone,pc] [--label name]
   rsh admin list          list registered keys
@@ -1192,6 +1351,10 @@ func main() {
 	switch args[0] {
 	case "keygen":
 		cmdKeygen()
+	case "login":
+		cmdLogin()
+	case "register":
+		cmdRegister()
 	case "admin":
 		if len(args) < 2 {
 			usage()
