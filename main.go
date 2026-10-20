@@ -607,7 +607,7 @@ func ensureKeyFile(name, content string) (string, error) {
 	return p, nil
 }
 
-func connect(base, target string) {
+func connect(base, target string, remoteCmd string) {
 	ar, err := authenticate()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "auth: %v\n", err)
@@ -695,6 +695,9 @@ func connect(base, target string) {
 	}
 
 	sshArgs = append(sshArgs, "-p", strconv.Itoa(sk.Port), fmt.Sprintf("%s@%s", sk.User, sk.Addr))
+	if strings.TrimSpace(remoteCmd) != "" {
+		sshArgs = append(sshArgs, strings.TrimSpace(remoteCmd))
+	}
 
 	if os.Getenv("RSH_DUMP") == "1" {
 		fmt.Fprintln(os.Stderr, "ssh "+strings.Join(sshArgs, " "))
@@ -1316,7 +1319,7 @@ func usage() {
 
 usage:
   rsh                     interactive server picker + connect
-  rsh <host>              connect to a host (vps/phone/pc)
+  rsh <host> [<command>]  connect / run a command on a host (vps/phone/pc)
   rsh keygen              generate auth keypair in ~/.rsh/
   rsh login               password login (auth.rival-afk.com) + bind ~/.rsh key
   rsh register            create account on auth server (waits for admin approval)
@@ -1344,7 +1347,7 @@ func main() {
 	base := authURL()
 	args := os.Args[1:]
 	if len(args) == 0 {
-		connect(base, "")
+		connect(base, "", "")
 		return
 	}
 	switch args[0] {
@@ -1379,6 +1382,6 @@ func main() {
 	case "help", "-h", "--help":
 		usage()
 	default:
-		connect(base, args[0])
+		connect(base, args[0], strings.Join(args[1:], " "))
 	}
 }
