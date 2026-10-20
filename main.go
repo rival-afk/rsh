@@ -776,11 +776,10 @@ func sshRun(base, target, remoteCmd string) {
 		fmt.Fprintln(os.Stderr, "ssh not found in PATH")
 		os.Exit(1)
 	}
-	out, err := exec.Command(sshBin, args...).CombinedOutput()
-	fmt.Print(string(out))
-	if err != nil {
-		os.Exit(1)
-	}
+	argv := append([]string{"ssh"}, args...)
+	syscall.Exec(sshBin, argv, os.Environ())
+	fmt.Fprintf(os.Stderr, "exec ssh: %v\n", err)
+	os.Exit(1)
 }
 
 // parseMAC accepts "fc:9d:05:23:95:fa" and returns 6 bytes.
