@@ -1,0 +1,12 @@
+[Unit]
+Description=rsh auto-update (git pull + rebuild)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/root/src/rsh/autoupdate.sh
+Environment=RSH_LOG=/var/log/rsh-autoupdate.log
+
+[Install]
+WantedBy=multi-user.target

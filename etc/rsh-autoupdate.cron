@@ -1,0 +1,3 @@
+# rsh auto-update: pull+rebuild every 15 minutes
+# install manually: (crontab -l 2>/dev/null; cat etc/rsh-autoupdate.cron) | crontab -
+*/15 * * * * $HOME/src/rsh/autoupdate.sh

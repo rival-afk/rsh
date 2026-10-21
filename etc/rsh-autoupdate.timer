@@ -1,0 +1,10 @@
+[Unit]
+Description=Run rsh auto-update periodically
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+Unit=rsh-autoupdate.service
+
+[Install]
+WantedBy=timers.target
