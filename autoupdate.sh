@@ -27,14 +27,12 @@ if git -C "$SRC" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
 		alog "git fetch failed (offline?)"
 		exit 1
 	}
-	BASE_HEAD=$(git -C "$SRC" rev-parse HEAD)
 	if git -C "$SRC" merge --quiet --ff-only "origin/$BRANCH" 2>>"$LOG"; then
+		BASE_HEAD=$(git -C "$SRC" rev-parse HEAD~1)
 		NEW_HEAD=$(git -C "$SRC" rev-parse HEAD)
-		if [ "$BASE_HEAD" = "$NEW_HEAD" ]; then
-			alog "up to date at $NEW_HEAD"
-			exit 0
+		if [ "$BASE_HEAD" != "$NEW_HEAD" ]; then
+			alog "updated $BASE_HEAD -> $NEW_HEAD ($(git -C "$SRC" rev-list --count "$BASE_HEAD..$NEW_HEAD") new commits)"
 		fi
-		alog "updated $BASE_HEAD -> $NEW_HEAD ($(git -C "$SRC" rev-list --count "$BASE_HEAD..$NEW_HEAD") new commits)"
 	else
 		alog "ff-merge failed (local changes? branch diverged)"
 		exit 1
