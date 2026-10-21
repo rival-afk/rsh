@@ -12,7 +12,7 @@
 set -u
 
 # systemd/low-end environments may not set HOME
-HOME="${HOME:-/root}"
+export HOME="${HOME:-/root}"
 
 BRANCH=${RSH_BRANCH:-main}
 GIT_URL=${RSH_GIT_URL:-https://github.com/rival-afk/rsh}
