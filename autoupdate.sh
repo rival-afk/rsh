@@ -52,6 +52,16 @@ command -v go >/dev/null 2>&1 || {
 	exit 0
 }
 cd "$SRC" || exit 1
+# rebuild unless the binary already exists and is not older than the checkout
+# (covers fresh clones and any case where the binary was not rebuilt)
+if [ -f "$BIN" ]; then
+	BIN_T=$(stat -c %Y "$BIN" 2>/dev/null || echo 0)
+	SRC_T=$(git log -1 --format=%ct)
+	if [ "$BIN_T" -ge "$SRC_T" ]; then
+		alog "up to date at $NEW_HEAD (binary fresh)"
+		exit 0
+	fi
+fi
 if go build -o "$BIN.new" . 2>>"$LOG"; then
 	mv "$BIN.new" "$BIN" 2>>"$LOG" || exit 1
 	chmod +x "$BIN" 2>>"$LOG"
