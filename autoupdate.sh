@@ -49,6 +49,7 @@ command -v go >/dev/null 2>&1 || {
 	alog "go not found, skipped build"
 	exit 0
 }
+export GOTOOLCHAIN=auto
 cd "$SRC" || exit 1
 # rebuild unless the binary already exists and is not older than the checkout
 # (covers fresh clones and any case where the binary was not rebuilt)
