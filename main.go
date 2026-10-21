@@ -263,6 +263,18 @@ func doAuth(baseURL string, k authKey) (*authResp, error) {
 	return &ar, nil
 }
 
+// statusf prints user-facing progress lines to stderr, so command stdout
+// stays machine-readable. Suppressed with RSH_QUIET=1 or while quiet probes
+// (pc sshd polling) are running.
+var statusQuiet bool
+
+func statusf(format string, args ...interface{}) {
+	if statusQuiet {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "rsh: "+format+"\n", args...)
+}
+
 func authenticate() (*authResp, error) {
 	keys, err := loadAuthKeys()
 	if err != nil {
@@ -271,8 +283,10 @@ func authenticate() (*authResp, error) {
 	base := authURL()
 	var lastErr error
 	for _, k := range keys {
+		statusf("GET %s…", base)
 		ar, err := doAuth(base, k)
 		if err == nil {
+			statusf("auth ok (role %s, hosts: %s)", ar.Role, strings.Join(ar.Hosts, ", "))
 			return ar, nil
 		}
 		lastErr = err
@@ -666,6 +680,7 @@ func connect(base, target string, remoteCmd string) {
 		fmt.Fprintf(os.Stderr, "parse: %v\n", err)
 		os.Exit(1)
 	}
+	statusf("ключ получен, устанавливаю соединение с %s…", host)
 
 	targetKeyFile, err := ensureKeyFile(host, sk.PrivateKey)
 	if err != nil {
@@ -750,6 +765,7 @@ func sshArgvAuthed(ar *authResp, base, target, remoteCmd string, extraOpts ...st
 	if code != 200 {
 		return "", nil, fmt.Errorf("sshkey failed (%d): %s", code, strings.TrimSpace(string(b)))
 	}
+	statusf("ключ получен, устанавливаю соединение с %s…", host)
 	var sk sshKeyResp
 	if err := json.Unmarshal(b, &sk); err != nil {
 		return "", nil, fmt.Errorf("parse: %v", err)
@@ -885,79 +901,99 @@ func cmdWOL(args []string) {
 	fmt.Printf("sent WoL magic packet to %s (port %d)\n", mac, port)
 }
 
+// wakeAndProvision sets up an ssh connection to the PC (uvol… whatever auth
+// already recorded). The /v1/sshkey provisioning on the auth server connects
+// to the target through the VPS tunnel, so its failure *is* the "PC is
+// offline" signal: in that case we burst WoL packets and retry provisioning
+// until the PC boots into sshd (pcWakeTimeout). argv is provisioned with
+// remoteCmd already included ("" for an interactive session).
+func wakeAndProvision(ar *authResp, base, remoteCmd string) (string, []string, error) {
+	attempt := func() (string, []string, error) {
+		statusQuiet = true
+		defer func() { statusQuiet = false }()
+		return sshArgvAuthed(ar, base, "pc", remoteCmd)
+	}
+	bin, argv, err := attempt()
+	if err == nil {
+		statusf("ПК в сети, устанавливаю соединение…")
+		return bin, argv, nil
+	}
+	s := err.Error()
+	// these can never be fixed by waking the machine — fail fast
+	if strings.HasPrefix(s, "host ") || strings.HasPrefix(s, "access denied") {
+		return "", nil, err
+	}
+
+	mac := loadRshConfig().WoL["pc"]
+	if mac == "" {
+		return "", nil, fmt.Errorf("no WoL MAC configured for 'pc' (see ~/.rsh/config.json \"wol\":{\"pc\":\"...\"}, and enable WoL in the BIOS/UEFI)")
+	}
+	statusf("ПК офлайн (%v) — отправляю WoL (%s, порт 9)…", err, mac)
+	start := time.Now()
+	for i := 0; i < 3; i++ { // 3 bursts, 1s apart: NICs drop single packets sometimes
+		if err := sendWOL(mac, 9); err != nil {
+			return "", nil, fmt.Errorf("wol: %v", err)
+		}
+		if i < 2 {
+			time.Sleep(time.Second)
+		}
+	}
+	deadline := time.Now().Add(pcWakeTimeout())
+	for attemptN := 1; ; attemptN++ {
+		if bin, argv, err = attempt(); err == nil {
+			statusf("ПК проснулся за %v, устанавливаю соединение…", time.Since(start).Round(time.Second))
+			return bin, argv, nil
+		}
+		if time.Now().After(deadline) {
+			return "", nil, fmt.Errorf("pc did not come up within %v (is Wake-on-LAN enabled in the BIOS/UEFI and the NIC?)", pcWakeTimeout())
+		}
+		statusf("жду, пока ПК поднимет sshd (попытка %d)…", attemptN)
+		time.Sleep(5 * time.Second)
+	}
+}
+
+// pcExecSSH runs a single remote command on the PC (wake via WoL first if
+// offline) and replaces the current process with ssh.
+func pcExecSSH(ar *authResp, base, remoteCmd string) {
+	bin, argv, err := wakeAndProvision(ar, base, remoteCmd)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "rsh pc: %v\n", err)
+		os.Exit(1)
+	}
+	syscall.Exec(bin, argv, os.Environ())
+}
+
 func cmdPC(base string, args []string) {
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "usage: rsh pc <on|off|reboot|status|exec ...>")
 		os.Exit(1)
 	}
+	ar, err := authenticate()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "auth: %v\n", err)
+		os.Exit(1)
+	}
 	switch args[0] {
 	case "on":
-		mac := loadRshConfig().WoL["pc"]
-		if mac == "" {
-			fmt.Fprintln(os.Stderr, "rsh pc on: no WoL MAC configured for 'pc' (see ~/.rsh/config.json \"wol\":{\"pc\":\"...\"})")
-			os.Exit(1)
-		}
-		// 3 bursts, 1s apart: NICs sometimes drop a single magic packet.
-		fmt.Printf("wake-on-LAN -> pc (%s)\n", mac)
-		for i := 0; i < 3; i++ {
-			if err := sendWOL(mac, 9); err != nil {
-				fmt.Fprintf(os.Stderr, "wol: %v\n", err)
-				os.Exit(1)
-			}
-			if i < 2 {
-				time.Sleep(time.Second)
-			}
-		}
-
-		// Authenticate once; provisioning is reused for every attempt.
-		ar, err := authenticate()
+		// wakes via WoL if offline, then execs into an interactive session
+		bin, argv, err := wakeAndProvision(ar, base, "")
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "auth: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Poll until the PC has booted far enough to accept SSH — WoL is
-		// fire-and-forget, boot can take anywhere from ~10s to a minute.
-		deadline := time.Now().Add(pcWakeTimeout)
-		for attempt := 1; ; attempt++ {
-			bin, argv, err := sshArgvAuthed(ar, base, "pc", "echo up",
-				"ConnectTimeout=8", "BatchMode=yes", "ServerAliveInterval=0")
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "ssh: %v\n", err)
-				os.Exit(1)
-			}
-			out, _ := exec.Command(bin, argv[1:]...).Output()
-			if strings.TrimSpace(string(out)) == "up" {
-				fmt.Printf("pc is awake (attempt %d), establishing ssh session...\n", attempt)
-				break
-			}
-			if time.Now().After(deadline) {
-				fmt.Fprintf(os.Stderr, "rsh pc on: pc did not accept ssh within %v (is Wake-on-LAN enabled in the BIOS/UEFI and the NIC?)\n", pcWakeTimeout)
-				os.Exit(1)
-			}
-			fmt.Fprintf(os.Stderr, "waiting for ssh on pc (attempt %d)...\n", attempt)
-			time.Sleep(5 * time.Second)
-		}
-
-		// Wake confirmed: exec into a real interactive ssh session.
-		bin, argv, err := sshArgvAuthed(ar, base, "pc", "")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "ssh: %v\n", err)
+			fmt.Fprintf(os.Stderr, "rsh pc on: %v\n", err)
 			os.Exit(1)
 		}
 		syscall.Exec(bin, argv, os.Environ())
 	case "off":
-		sshRun(base, "pc", `systemctl poweroff 2>/dev/null || poweroff`)
+		pcExecSSH(ar, base, `systemctl poweroff 2>/dev/null || poweroff`)
 	case "reboot":
-		sshRun(base, "pc", `systemctl reboot 2>/dev/null || reboot`)
+		pcExecSSH(ar, base, `systemctl reboot 2>/dev/null || reboot`)
 	case "status":
-		sshRun(base, "pc", `echo ON; hostname; uptime -p 2>/dev/null || uptime; if command -v systemctl >/dev/null 2>&1; then systemctl is-active sshd; else rc-service sshd status; fi; true`)
+		pcExecSSH(ar, base, `echo ON; hostname; uptime -p 2>/dev/null || uptime; if command -v systemctl >/dev/null 2>&1; then systemctl is-active sshd; else rc-service sshd status; fi; true`)
 	case "exec":
 		if len(args) < 2 {
 			fmt.Fprintln(os.Stderr, "usage: rsh pc exec <command>")
 			os.Exit(1)
 		}
-		sshRun(base, "pc", strings.Join(args[1:], " "))
+		pcExecSSH(ar, base, strings.Join(args[1:], " "))
 	default:
 		fmt.Fprintln(os.Stderr, "usage: rsh pc <on|off|reboot|status|exec ...>")
 		os.Exit(1)
@@ -968,11 +1004,19 @@ const (
 	netMagicDiscover = "RIVAL-DISCOVER v1"
 	netMagicHello    = "RIVAL-HELLO"
 	netDefaultPort   = 47800
-
-	// How long `rsh pc on` keeps polling for sshd after a WoL burst
-	// before giving up (PCs can take a while to POST + boot).
-	pcWakeTimeout = 2 * time.Minute
 )
+
+// pcWakeTimeout is how long the WoL flow keeps re-provisioning before giving
+// up (PCs can take a while to POST + boot). Override for tests/quick
+// environments with RSH_PC_WAKE_TIMEOUT=<seconds>.
+func pcWakeTimeout() time.Duration {
+	if v := os.Getenv("RSH_PC_WAKE_TIMEOUT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return 2 * time.Minute
+}
 
 func isPrivateIPv4(ip net.IP) bool {
 	ip4 := ip.To4()
@@ -1399,10 +1443,10 @@ usage:
   rsh net find <label>    query auth for a peer's current LAN IP
   rsh net resolve <label> print a peer's IP: discover -> find -> override file
   rsh wol <mac|label>  send Wake-on-LAN magic packet (--port 9)
-  rsh pc on            WoL the PC, poll until sshd is up, then open an ssh session
-  rsh pc off|reboot    power off / reboot the PC (via ssh)
-  rsh pc status        print PC online? / uptime / sshd via ssh
-  rsh pc exec <cmd>    run a command on the PC via ssh
+  rsh pc on            если ПК офлайн — WoL, дождаться sshd, открыть ssh-сессию
+  rsh pc off|reboot    выключить / перезагрузить ПК (если офлайн — сначала WoL)
+  rsh pc status        статус ПК (если офлайн — сначала WoL)
+  rsh pc exec <cmd>    команда на ПК (если офлайн — сначала WoL)
 
 auth endpoint: %s (override: RSH_AUTH_URL or ~/.rsh/config.json auth_url)
 `, authURL())
