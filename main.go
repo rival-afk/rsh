@@ -713,17 +713,24 @@ func connect(base, target string, remoteCmd string) {
 	syscall.Exec(sshBin, argv, os.Environ())
 }
 
-// sshRun mirrors connect() but runs a single remote command (non-interactive),
-// reusing the same auth + provisioned key + jump (VPS tunnel) path.
-func sshRun(base, target, remoteCmd string) {
+// sshArgv performs auth, host validation and ssh-key provisioning for target
+// and returns the ssh binary path plus a complete argv (argv[0] is "ssh").
+// extraOpts are injected before the "user@host" destination as "-o <opt>"
+// pairs. Shared by sshRun and the pc wake-then-connect flow.
+func sshArgv(base, target, remoteCmd string, extraOpts ...string) (string, []string, error) {
 	ar, err := authenticate()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "auth: %v\n", err)
-		os.Exit(1)
+		return "", nil, fmt.Errorf("auth: %v", err)
 	}
 	if !isPrivileged(ar.Role) {
-		fmt.Fprintf(os.Stderr, "access denied: role %q cannot run commands\n", ar.Role)
-		os.Exit(1)
+		return "", nil, fmt.Errorf("access denied: role %q cannot open SSH sessions", ar.Role)
+	}
+	return sshArgvAuthed(ar, base, target, remoteCmd, extraOpts...)
+}
+
+func sshArgvAuthed(ar *authResp, base, target, remoteCmd string, extraOpts ...string) (string, []string, error) {
+	if !isPrivileged(ar.Role) {
+		return "", nil, fmt.Errorf("access denied: role %q cannot open SSH sessions", ar.Role)
 	}
 	host := target
 	found := false
@@ -734,25 +741,24 @@ func sshRun(base, target, remoteCmd string) {
 		}
 	}
 	if !found {
-		fmt.Fprintf(os.Stderr, "host %q not available (allowed: %s)\n", target, strings.Join(ar.Hosts, ", "))
-		os.Exit(1)
+		return "", nil, fmt.Errorf("host %q not available (allowed: %s)", target, strings.Join(ar.Hosts, ", "))
 	}
 	code, b, err := apiPost(base, "/v1/sshkey", ar.Token, map[string]string{"host": host})
-	if err != nil || code != 200 {
-		fmt.Fprintf(os.Stderr, "sshkey failed: %v %s\n", err, strings.TrimSpace(string(b)))
-		os.Exit(1)
+	if err != nil {
+		return "", nil, fmt.Errorf("sshkey: %v", err)
+	}
+	if code != 200 {
+		return "", nil, fmt.Errorf("sshkey failed (%d): %s", code, strings.TrimSpace(string(b)))
 	}
 	var sk sshKeyResp
 	if err := json.Unmarshal(b, &sk); err != nil {
-		fmt.Fprintf(os.Stderr, "parse: %v\n", err)
-		os.Exit(1)
-	}
-	targetKeyFile, err := ensureKeyFile(host, sk.PrivateKey)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "write key: %v\n", err)
-		os.Exit(1)
+		return "", nil, fmt.Errorf("parse: %v", err)
 	}
 	kh := knownHostsFile()
+	targetKeyFile, err := ensureKeyFile(host, sk.PrivateKey)
+	if err != nil {
+		return "", nil, fmt.Errorf("write key: %v", err)
+	}
 	args := []string{
 		"-i", targetKeyFile,
 		"-o", "IdentitiesOnly=yes",
@@ -765,24 +771,35 @@ func sshRun(base, target, remoteCmd string) {
 	if sk.Jump != nil {
 		jumpKeyFile, err := ensureKeyFile(host+"-jump", sk.Jump.PrivateKey)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "write jump key: %v\n", err)
-			os.Exit(1)
+			return "", nil, fmt.Errorf("write jump key: %v", err)
 		}
 		proxy := fmt.Sprintf("ssh -i %s -o IdentitiesOnly=yes -o UserKnownHostsFile=%s -o StrictHostKeyChecking=accept-new -W %%h:%%p %s@%s -p %d",
 			jumpKeyFile, kh, sk.Jump.User, sk.Jump.Addr, sk.Jump.Port)
 		args = append(args, "-o", "ProxyCommand="+proxy)
 	}
+	for _, o := range extraOpts {
+		args = append(args, "-o", o)
+	}
 	args = append(args, "-p", strconv.Itoa(sk.Port), fmt.Sprintf("%s@%s", sk.User, sk.Addr))
-	args = append(args, remoteCmd)
-	sshBin, err := lookPath("ssh")
+	if strings.TrimSpace(remoteCmd) != "" {
+		args = append(args, strings.TrimSpace(remoteCmd))
+	}
+	bin, err := lookPath("ssh")
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "ssh not found in PATH")
+		return "", nil, fmt.Errorf("ssh not found in PATH")
+	}
+	return bin, append([]string{"ssh"}, args...), nil
+}
+
+// sshRun runs a single remote command (non-interactive), reusing the same
+// auth + provisioned key + jump (VPS tunnel) path.
+func sshRun(base, target, remoteCmd string) {
+	bin, argv, err := sshArgv(base, target, remoteCmd)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
-	argv := append([]string{"ssh"}, args...)
-	syscall.Exec(sshBin, argv, os.Environ())
-	fmt.Fprintf(os.Stderr, "exec ssh: %v\n", err)
-	os.Exit(1)
+	syscall.Exec(bin, argv, os.Environ())
 }
 
 // parseMAC accepts "fc:9d:05:23:95:fa" and returns 6 bytes.
@@ -880,11 +897,55 @@ func cmdPC(base string, args []string) {
 			fmt.Fprintln(os.Stderr, "rsh pc on: no WoL MAC configured for 'pc' (see ~/.rsh/config.json \"wol\":{\"pc\":\"...\"})")
 			os.Exit(1)
 		}
-		if err := sendWOL(mac, 9); err != nil {
-			fmt.Fprintf(os.Stderr, "wol: %v\n", err)
+		// 3 bursts, 1s apart: NICs sometimes drop a single magic packet.
+		fmt.Printf("wake-on-LAN -> pc (%s)\n", mac)
+		for i := 0; i < 3; i++ {
+			if err := sendWOL(mac, 9); err != nil {
+				fmt.Fprintf(os.Stderr, "wol: %v\n", err)
+				os.Exit(1)
+			}
+			if i < 2 {
+				time.Sleep(time.Second)
+			}
+		}
+
+		// Authenticate once; provisioning is reused for every attempt.
+		ar, err := authenticate()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "auth: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("wake-on-LAN sent to pc (%s)\n", mac)
+
+		// Poll until the PC has booted far enough to accept SSH — WoL is
+		// fire-and-forget, boot can take anywhere from ~10s to a minute.
+		deadline := time.Now().Add(pcWakeTimeout)
+		for attempt := 1; ; attempt++ {
+			bin, argv, err := sshArgvAuthed(ar, base, "pc", "echo up",
+				"ConnectTimeout=8", "BatchMode=yes", "ServerAliveInterval=0")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "ssh: %v\n", err)
+				os.Exit(1)
+			}
+			out, _ := exec.Command(bin, argv[1:]...).Output()
+			if strings.TrimSpace(string(out)) == "up" {
+				fmt.Printf("pc is awake (attempt %d), establishing ssh session...\n", attempt)
+				break
+			}
+			if time.Now().After(deadline) {
+				fmt.Fprintf(os.Stderr, "rsh pc on: pc did not accept ssh within %v (is Wake-on-LAN enabled in the BIOS/UEFI and the NIC?)\n", pcWakeTimeout)
+				os.Exit(1)
+			}
+			fmt.Fprintf(os.Stderr, "waiting for ssh on pc (attempt %d)...\n", attempt)
+			time.Sleep(5 * time.Second)
+		}
+
+		// Wake confirmed: exec into a real interactive ssh session.
+		bin, argv, err := sshArgvAuthed(ar, base, "pc", "")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ssh: %v\n", err)
+			os.Exit(1)
+		}
+		syscall.Exec(bin, argv, os.Environ())
 	case "off":
 		sshRun(base, "pc", `systemctl poweroff 2>/dev/null || poweroff`)
 	case "reboot":
@@ -907,6 +968,10 @@ const (
 	netMagicDiscover = "RIVAL-DISCOVER v1"
 	netMagicHello    = "RIVAL-HELLO"
 	netDefaultPort   = 47800
+
+	// How long `rsh pc on` keeps polling for sshd after a WoL burst
+	// before giving up (PCs can take a while to POST + boot).
+	pcWakeTimeout = 2 * time.Minute
 )
 
 func isPrivateIPv4(ip net.IP) bool {
@@ -1334,7 +1399,7 @@ usage:
   rsh net find <label>    query auth for a peer's current LAN IP
   rsh net resolve <label> print a peer's IP: discover -> find -> override file
   rsh wol <mac|label>  send Wake-on-LAN magic packet (--port 9)
-  rsh pc on            send WoL to the PC (label 'pc' in config.wol)
+  rsh pc on            WoL the PC, poll until sshd is up, then open an ssh session
   rsh pc off|reboot    power off / reboot the PC (via ssh)
   rsh pc status        print PC online? / uptime / sshd via ssh
   rsh pc exec <cmd>    run a command on the PC via ssh
