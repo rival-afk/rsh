@@ -76,6 +76,10 @@ type authResp struct {
 	Role  string   `json:"role"`
 	Hosts []string `json:"hosts"`
 	Exp   int64    `json:"exp"`
+	// 2fa
+	Need2FA      bool   `json:"need_2fa"`
+	DeviceToken  string `json:"device_token,omitempty"`
+	TwoFAWarning string `json:"2fa_warning,omitempty"`
 }
 
 type sshKeyResp struct {
@@ -240,14 +244,76 @@ func loadAuthKeys() ([]authKey, error) {
 	return keys, nil
 }
 
-func doAuth(baseURL string, k authKey) (*authResp, error) {
+// deviceTokenFile — маркер доверенного устройства (2FA вводится один раз).
+// device-токен выдаёт auth после первого успешного TOTP/recovery на ЭТОЙ машине.
+func deviceTokenPath() string {
+	return filepath.Join(rshDir(), ".device_token")
+}
+
+func loadDeviceToken() string {
+	b, err := os.ReadFile(deviceTokenPath())
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+func saveDeviceToken(t string) {
+	if t == "" {
+		return
+	}
+	_ = os.WriteFile(deviceTokenPath(), []byte(t), 0o600)
+}
+
+// prompt2FA — код с терминала или из окружения (для скриптов).
+func prompt2FA() (totp, recovery string) {
+	v := strings.TrimSpace(os.Getenv("RSH_TOTP"))
+	if v == "" && termInteractive() {
+		fmt.Fprint(os.Stderr, "Код 2FA (Google Authenticator; длиннее 6 символов = recovery-код): ")
+		v = strings.TrimSpace(readLineStdin())
+	}
+	if v == "" {
+		fmt.Fprintln(os.Stderr, "2FA required: передай RSH_TOTP=<код> окружением или ответь в промпте")
+		os.Exit(3)
+	}
+	digits := true
+	for _, c := range v {
+		if c < '0' || c > '9' {
+			digits = false
+			break
+		}
+	}
+	if len(v) == 6 && digits {
+		return v, ""
+	}
+	return "", v
+}
+
+func readLineStdin() string {
+	r := bufio.NewReader(os.Stdin)
+	l, _ := r.ReadString('\n')
+	return l
+}
+
+func termInteractive() bool {
+	fi, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
+
+func doAuth(baseURL string, k authKey, totp, recovery string) (*authResp, error) {
 	ts := time.Now().Unix()
 	msg := fmt.Sprintf("rival-auth-v1|%s|%d", k.pub, ts)
 	sig := ed25519.Sign(k.priv, []byte(msg))
 	body, _ := json.Marshal(map[string]interface{}{
-		"pubkey": k.pub,
-		"ts":     ts,
-		"sig":    hex.EncodeToString(sig),
+		"pubkey":       k.pub,
+		"ts":           ts,
+		"sig":          hex.EncodeToString(sig),
+		"device_token": loadDeviceToken(),
+		"totp":         totp,
+		"recovery":     recovery,
 	})
 	resp, err := authClient.Post(baseURL+"/v1/auth", "application/json", bytes.NewReader(body))
 	if err != nil {
@@ -262,6 +328,7 @@ func doAuth(baseURL string, k authKey) (*authResp, error) {
 	if err := json.Unmarshal(b, &ar); err != nil {
 		return nil, err
 	}
+	saveDeviceToken(ar.DeviceToken)
 	return &ar, nil
 }
 
@@ -286,14 +353,95 @@ func authenticate() (*authResp, error) {
 	var lastErr error
 	for _, k := range keys {
 		statusf("GET %s…", base)
-		ar, err := doAuth(base, k)
+		ar, err := doAuth(base, k, "", "")
 		if err == nil {
+			if ar.Need2FA {
+				totp, rec := prompt2FA()
+				statusf("2FA verify…")
+				ar, err = doAuth(base, k, totp, rec)
+				if err != nil {
+					lastErr = err
+					continue
+				}
+			}
+			if ar.TwoFAWarning != "" {
+				fmt.Fprintf(os.Stderr, "rsh: ВНИМАНИЕ: %s\n", ar.TwoFAWarning)
+			}
 			statusf("auth ok (role %s, hosts: %s)", ar.Role, strings.Join(ar.Hosts, ", "))
 			return ar, nil
 		}
 		lastErr = err
 	}
 	return nil, lastErr
+}
+
+// cmd2fa — управление 2FA аккаунта: init/confirm/status/disable.
+func cmd2fa(base string, args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: rsh 2fa init | confirm <code> | status | disable <code>")
+		os.Exit(1)
+	}
+	ar, err := authenticate()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "auth: %v\n", err)
+		os.Exit(1)
+	}
+	switch args[0] {
+	case "init":
+		code, b, err := apiPost(base, "/v1/2fa/init", ar.Token, nil)
+		if err != nil || code != 200 {
+			fmt.Fprintf(os.Stderr, "init failed (%d): %s\n", code, strings.TrimSpace(string(b)))
+			os.Exit(1)
+		}
+		var out struct {
+			Secret  string `json:"secret"`
+			Otpauth string `json:"otpauth"`
+		}
+		json.Unmarshal(b, &out)
+		fmt.Printf("Секрет (в Google Authenticator «плюс» → «ввести ключ вручную»):\n%s\n\nИли отсканируй:\n%s\n", out.Secret, out.Otpauth)
+	case "confirm":
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "usage: rsh 2fa confirm <6-digit code>")
+			os.Exit(1)
+		}
+		code, b, err := apiPost(base, "/v1/2fa/confirm", ar.Token, map[string]string{"code": args[1]})
+		if err != nil || code != 200 {
+			fmt.Fprintf(os.Stderr, "confirm failed (%d): %s\n", code, strings.TrimSpace(string(b)))
+			os.Exit(1)
+		}
+		var out struct {
+			Recovery    []string `json:"recovery"`
+			DeviceToken string   `json:"device_token"`
+		}
+		json.Unmarshal(b, &out)
+		saveDeviceToken(out.DeviceToken)
+		fmt.Printf("2FA включена. Recovery-коды (одноразовые, сохрани сейчас — больше не покажутся):\n")
+		for _, c := range out.Recovery {
+			fmt.Printf("  %s\n", c)
+		}
+	case "status":
+		code, b, err := apiDo(base, "GET", "/v1/2fa/status", ar.Token)
+		if err != nil || code != 200 {
+			fmt.Fprintf(os.Stderr, "status failed (%d): %s\n", code, strings.TrimSpace(string(b)))
+			os.Exit(1)
+		}
+		fmt.Println(strings.TrimSpace(string(b)))
+	case "disable":
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "usage: rsh 2fa disable <code|recovery>")
+			os.Exit(1)
+		}
+		code, b, err := apiPost(base, "/v1/2fa/disable", ar.Token, map[string]string{"code": args[1]})
+		if err != nil || code != 200 {
+			fmt.Fprintf(os.Stderr, "disable failed (%d): %s\n", code, strings.TrimSpace(string(b)))
+			os.Exit(1)
+		}
+		_ = os.Remove(deviceTokenPath())
+		fmt.Println("2FA выключена. device-токен локально стёрт.")
+	default:
+		fmt.Fprintln(os.Stderr, "usage: rsh 2fa init | confirm <code> | status | disable <code>")
+		os.Exit(1)
+	}
 }
 
 func cmdKeygen() {
@@ -1736,6 +1884,8 @@ func main() {
 		cmdNet(args[1:])
 	case "wol":
 		cmdWOL(args[1:])
+	case "2fa":
+		cmd2fa(base, args[1:])
 	case "pc":
 		cmdPC(base, args[1:])
 	case "help", "-h", "--help":
