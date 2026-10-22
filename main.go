@@ -83,6 +83,7 @@ type sshKeyResp struct {
 	Addr       string `json:"addr"`
 	Port       int    `json:"port"`
 	PrivateKey string `json:"private_key"`
+	ClientIP   string `json:"client_ip"` // публичный IP клиента по мнению auth-сервера
 	Jump       *struct {
 		Addr       string `json:"addr"`
 		Port       int    `json:"port"`
@@ -621,6 +622,58 @@ func ensureKeyFile(name, content string) (string, error) {
 	return p, nil
 }
 
+// tmpN — номер tmp-папки для rsh -t (0 = выкл). Задается в main().
+var tmpN int
+
+// tmpBootstrap готовит временную папку на таргете и делает её cwd.
+// Правила:
+//   - папка $HOME/.rsh/tmp/rsh-t<N>;
+//   - владелец — публичный ip клиента (как его видит auth-сервер), хранится
+//     в .acl (строка 1 = ip, строка 2 = unix-ts последней активности);
+//   - неактивность > 24ч — папка удаляется лениво при следующем заходе
+//     (пока никто не пришёл — папка живёт сколько угодно);
+//   - заход с другого ip — отказ (exit 3).
+//
+// isDigits — непустая строка из цифр (номер tmp-папки в "-t <N>").
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func tmpBootstrap(n int, ip, cmd string) string {
+	d := "$HOME/.rsh/tmp/rsh-t" + strconv.Itoa(n)
+	var b strings.Builder
+	fmt.Fprintf(&b, "D=%s; ts=$(date +%%s)\n", d)
+	fmt.Fprintf(&b, "if [ ! -f ${D}/.acl ]; then\n")
+	fmt.Fprintf(&b, "  mkdir -p %[1]s && printf '%%%%s\\n%%%%s\\n' '%[2]s' \"$ts\" > ${D}/.acl\n", d, ip)
+	fmt.Fprintf(&b, "else\n")
+	fmt.Fprintf(&b, "  if [ \"$(head -1 ${D}/.acl)\" != '%s' ]; then\n", ip)
+	fmt.Fprintf(&b, "    echo \"rsh: -t %d принадлежит ip $(head -1 ${D}/.acl); отказ\" >&2; exit 3\n", n)
+	fmt.Fprintf(&b, "  fi\n")
+	fmt.Fprintf(&b, "  sed -i \"2s/.*/$ts/\" ${D}/.acl\n")
+	fmt.Fprintf(&b, "fi\n")
+	fmt.Fprintf(&b, "for d in $HOME/.rsh/tmp/rsh-t*; do\n")
+	fmt.Fprintf(&b, "  [ -d \"$d\" ] || continue\n")
+	fmt.Fprintf(&b, "  a=$(sed -n '2p' \"$d/.acl\" 2>/dev/null)\n")
+	fmt.Fprintf(&b, "  case ${a:-z} in *[!0-9]*) continue ;; esac\n")
+	fmt.Fprintf(&b, "  [ $((ts - a)) -gt 86400 ] && rm -rf \"$d\"\n")
+	fmt.Fprintf(&b, "done\n")
+	fmt.Fprintf(&b, "cd %s || exit 4\n", d)
+	if strings.TrimSpace(cmd) == "" {
+		b.WriteString("exec ${SHELL:-/bin/bash}\n")
+	} else {
+		b.WriteString(strings.TrimSpace(cmd) + "\n")
+	}
+	return b.String()
+}
+
 func connect(base, target string, remoteCmd string) {
 	ar, err := authenticate()
 	if err != nil {
@@ -710,7 +763,14 @@ func connect(base, target string, remoteCmd string) {
 	}
 
 	sshArgs = append(sshArgs, "-p", strconv.Itoa(sk.Port), fmt.Sprintf("%s@%s", sk.User, sk.Addr))
-	if strings.TrimSpace(remoteCmd) != "" {
+	if tmpN > 0 {
+		if strings.TrimSpace(sk.ClientIP) == "" {
+			fmt.Fprintln(os.Stderr, "rsh: -t требует обновлённый rival-auth (нет client_ip в /v1/sshkey)")
+			os.Exit(1)
+		}
+		remoteCmd = tmpBootstrap(tmpN, sk.ClientIP, remoteCmd)
+		sshArgs = append(sshArgs, remoteCmd)
+	} else if strings.TrimSpace(remoteCmd) != "" {
 		sshArgs = append(sshArgs, strings.TrimSpace(remoteCmd))
 	}
 
@@ -1460,6 +1520,33 @@ func main() {
 		return
 	}
 	switch args[0] {
+	case "-t", "-t1", "-t2", "-t3", "-t4", "-t5", "-t6", "-t7", "-t8", "-t9":
+		rest := args[1:]
+		sfx := strings.TrimPrefix(args[0], "-t")
+		if sfx != "" {
+			v, err := strconv.Atoi(sfx)
+			if err != nil || v < 1 {
+				fmt.Fprintln(os.Stderr, "-t: номер должен быть 1..9")
+				os.Exit(1)
+			}
+			tmpN = v
+		}
+		// -t <N> <host> <cmd> — если N прямо номером написан
+		if sfx == "" && len(rest) > 1 && isDigits(rest[0]) {
+			v, err := strconv.Atoi(rest[0])
+			if err != nil || v < 1 || v > 9 {
+				fmt.Fprintln(os.Stderr, "-t: номер должен быть 1..9")
+				os.Exit(1)
+			}
+			tmpN = v
+			rest = rest[1:]
+		}
+		if len(rest) == 0 {
+			usage()
+			os.Exit(1)
+		}
+		connect(base, rest[0], strings.Join(rest[1:], " "))
+		return
 	case "keygen":
 		cmdKeygen()
 	case "login":
