@@ -650,22 +650,22 @@ func isDigits(s string) bool {
 func tmpBootstrap(n int, ip, cmd string) string {
 	d := "$HOME/.rsh/tmp/rsh-t" + strconv.Itoa(n)
 	var b strings.Builder
-	fmt.Fprintf(&b, "D=%s; ts=$(date +%%s)\n", d)
-	fmt.Fprintf(&b, "if [ ! -f ${D}/.acl ]; then\n")
-	fmt.Fprintf(&b, "  mkdir -p %[1]s && printf '%%%%s\\n%%%%s\\n' '%[2]s' \"$ts\" > ${D}/.acl\n", d, ip)
-	fmt.Fprintf(&b, "else\n")
-	fmt.Fprintf(&b, "  if [ \"$(head -1 ${D}/.acl)\" != '%s' ]; then\n", ip)
-	fmt.Fprintf(&b, "    echo \"rsh: -t %d принадлежит ip $(head -1 ${D}/.acl); отказ\" >&2; exit 3\n", n)
-	fmt.Fprintf(&b, "  fi\n")
-	fmt.Fprintf(&b, "  sed -i \"2s/.*/$ts/\" ${D}/.acl\n")
-	fmt.Fprintf(&b, "fi\n")
-	fmt.Fprintf(&b, "for d in $HOME/.rsh/tmp/rsh-t*; do\n")
-	fmt.Fprintf(&b, "  [ -d \"$d\" ] || continue\n")
-	fmt.Fprintf(&b, "  a=$(sed -n '2p' \"$d/.acl\" 2>/dev/null)\n")
-	fmt.Fprintf(&b, "  case ${a:-z} in *[!0-9]*) continue ;; esac\n")
-	fmt.Fprintf(&b, "  [ $((ts - a)) -gt 86400 ] && rm -rf \"$d\"\n")
-	fmt.Fprintf(&b, "done\n")
-	fmt.Fprintf(&b, "cd %s || exit 4\n", d)
+	b.WriteString("D=" + d + "; ts=$(date +%s)\n")
+	b.WriteString("if [ ! -f ${D}/.acl ]; then\n")
+	b.WriteString("  mkdir -p " + d + " && printf '%s\\n%s\\n' '" + ip + "' \"$ts\" > ${D}/.acl\n")
+	b.WriteString("else\n")
+	b.WriteString("  if [ \"$(head -1 ${D}/.acl)\" != '" + ip + "' ]; then\n")
+	b.WriteString("    echo \"rsh: -t " + strconv.Itoa(n) + " принадлежит ip $(head -1 ${D}/.acl); отказ\" >&2; exit 3\n")
+	b.WriteString("  fi\n")
+	b.WriteString("  sed -i \"2s/.*/$ts/\" ${D}/.acl\n")
+	b.WriteString("fi\n")
+	b.WriteString("for d in $HOME/.rsh/tmp/rsh-t*; do\n")
+	b.WriteString("  [ -d \"$d\" ] || continue\n")
+	b.WriteString("  a=$(sed -n '2p' \"$d/.acl\" 2>/dev/null)\n")
+	b.WriteString("  case ${a:-z} in *[!0-9]*) continue ;; esac\n")
+	b.WriteString("  [ $((ts - a)) -gt 86400 ] && rm -rf \"$d\"\n")
+	b.WriteString("done\n")
+	b.WriteString("cd " + d + " || exit 4\n")
 	if strings.TrimSpace(cmd) == "" {
 		b.WriteString("exec ${SHELL:-/bin/bash}\n")
 	} else {
@@ -1489,6 +1489,8 @@ func usage() {
 usage:
   rsh                     interactive server picker + connect
   rsh <host> [<command>]  connect / run a command on a host (vps/phone/pc)
+  rsh -t [N] <host> [<cmd>]  tmp-папка rsh-t<N> на таргете как cwd (владелец = ip
+                              клиента; чистится после 24ч неактивности)
   rsh keygen              generate auth keypair in ~/.rsh/
   rsh login               password login (auth.rival-afk.com) + bind ~/.rsh key
   rsh register            create account on auth server (waits for admin approval)
@@ -1523,6 +1525,7 @@ func main() {
 	case "-t", "-t1", "-t2", "-t3", "-t4", "-t5", "-t6", "-t7", "-t8", "-t9":
 		rest := args[1:]
 		sfx := strings.TrimPrefix(args[0], "-t")
+		tmpN = 1 // голый -t = -t1
 		if sfx != "" {
 			v, err := strconv.Atoi(sfx)
 			if err != nil || v < 1 {
