@@ -1864,6 +1864,15 @@ func main() {
 			cmdPC(base, rest[1:])
 			return
 		}
+		// подкоманда exec: `rsh -t [N] <host> exec <команда>`
+		if len(rest) >= 2 && rest[1] == "exec" {
+			if len(rest) < 3 {
+				fmt.Fprintln(os.Stderr, "usage: rsh -t [N]", rest[0], "exec <command>")
+				os.Exit(1)
+			}
+			connect(base, rest[0], strings.Join(rest[2:], " "))
+			return
+		}
 		connect(base, rest[0], strings.Join(rest[1:], " "))
 		return
 	case "push", "pull":
@@ -1901,6 +1910,15 @@ func main() {
 	case "help", "-h", "--help":
 		usage()
 	default:
+		// подкоманда exec: `rsh <host> exec <команда>` (как у pc)
+		if len(args) >= 2 && args[1] == "exec" {
+			if len(args) < 3 {
+				fmt.Fprintln(os.Stderr, "usage: rsh", args[0], "exec <command>")
+				os.Exit(1)
+			}
+			connect(base, args[0], strings.Join(args[2:], " "))
+			return
+		}
 		connect(base, args[0], strings.Join(args[1:], " "))
 	}
 }
