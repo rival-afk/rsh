@@ -674,6 +674,82 @@ func tmpBootstrap(n int, ip, cmd string) string {
 	return b.String()
 }
 
+// shQ — shell-кавычки для одиночного аргумента (пути src/dst в push/pull).
+func shQ(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// cmdTransfer: rsh push <host> <src|_-> <dst> и rsh pull <host> <src> <dst|->
+//
+//   - push: src "-" берёт данные из stdin;   pull: dst "-" пишет в stdout
+//     transport: тот же ssh-канал (туннель), remote: mkdir(dirname)+cat. Без sftp —
+//     работает и на redmi (sshd без sftp-подсистемы).
+func cmdTransfer(base, mode string, args []string) {
+	if len(args) != 3 {
+		fmt.Fprintln(os.Stderr, "usage: rsh push <host> <localfile|-> <remotepath>\n       rsh pull <host> <remotepath> <localfile|->")
+		os.Exit(1)
+	}
+	host, a, b := args[0], args[1], args[2]
+	var remoteCmd string
+	if mode == "push" {
+		remoteCmd = `mkdir -p "$(dirname -- ` + shQ(b) + `)" && cat -- > ` + shQ(b)
+	} else {
+		remoteCmd = `cat -- ` + shQ(a)
+	}
+	bin, argv, err := sshArgv(base, host, remoteCmd)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+	if os.Getenv("RSH_DUMP") == "1" {
+		fmt.Fprintln(os.Stderr, "ssh "+strings.Join(argv, " "))
+	}
+	var ebuf bytes.Buffer
+	cmd := exec.Command(bin, argv[1:]...)
+	cmd.Args[0] = bin
+	cmd.Stderr = &ebuf
+	if mode == "push" {
+		if a == "-" {
+			cmd.Stdin = os.Stdin
+		} else {
+			f, oerr := os.Open(a)
+			if oerr != nil {
+				fmt.Fprintf(os.Stderr, "push: %v\n", oerr)
+				os.Exit(1)
+			}
+			defer f.Close()
+			cmd.Stdin = f
+		}
+		if rerr := cmd.Run(); rerr != nil {
+			fmt.Fprintf(os.Stderr, "push не удался: %v\n%s\n", rerr, strings.TrimSpace(ebuf.String()))
+			os.Exit(1)
+		}
+		return
+	}
+	// pull
+	var out io.Writer
+	var f *os.File
+	if b == "-" {
+		out = os.Stdout
+	} else {
+		f, err = os.Create(b)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "pull: %v\n", err)
+			os.Exit(1)
+		}
+		defer f.Close()
+		out = f
+	}
+	cmd.Stdout = out
+	if rerr := cmd.Run(); rerr != nil {
+		if b != "-" {
+			os.Remove(b) // не оставляем полупустой файл
+		}
+		fmt.Fprintf(os.Stderr, "pull не удался: %v\n%s\n", rerr, strings.TrimSpace(ebuf.String()))
+		os.Exit(1)
+	}
+}
+
 func connect(base, target string, remoteCmd string) {
 	ar, err := authenticate()
 	if err != nil {
@@ -857,6 +933,13 @@ func sshArgvAuthed(ar *authResp, base, target, remoteCmd string, extraOpts ...st
 		args = append(args, "-o", o)
 	}
 	args = append(args, "-p", strconv.Itoa(sk.Port), fmt.Sprintf("%s@%s", sk.User, sk.Addr))
+	if tmpN > 0 {
+		// rsh -t: обёртка полной tmp-папки (в sshArgvAuthed — чтобы покрыть и pc exec)
+		if strings.TrimSpace(sk.ClientIP) == "" {
+			return "", nil, fmt.Errorf("-t требует обновлённый rival-auth (нет client_ip в /v1/sshkey)")
+		}
+		remoteCmd = tmpBootstrap(tmpN, sk.ClientIP, remoteCmd)
+	}
 	if strings.TrimSpace(remoteCmd) != "" {
 		args = append(args, strings.TrimSpace(remoteCmd))
 	}
@@ -1548,8 +1631,15 @@ func main() {
 			usage()
 			os.Exit(1)
 		}
+		// на PC роутим через cmdPC (там wake/provision): -t внутри через tmpN
+		if rest[0] == "pc" {
+			cmdPC(base, rest)
+			return
+		}
 		connect(base, rest[0], strings.Join(rest[1:], " "))
 		return
+	case "push", "pull":
+		cmdTransfer(base, args[0], args[1:])
 	case "keygen":
 		cmdKeygen()
 	case "login":
