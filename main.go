@@ -1290,6 +1290,8 @@ func wakeAndProvision(ar *authResp, base, remoteCmd string) (string, []string, e
 	if strings.HasPrefix(s, "host ") || strings.HasPrefix(s, "access denied") {
 		return "", nil, err
 	}
+	// причина провала пробы важнее гадания (WoL может быть и не нужен)
+	fmt.Fprintf(os.Stderr, "rsh: проба пк не прошла: %v\n", err)
 
 	mac := loadRshConfig().WoL["pc"]
 	if mac == "" {
@@ -1857,7 +1859,7 @@ func main() {
 		}
 		// на PC роутим через cmdPC (там wake/provision): -t внутри через tmpN
 		if rest[0] == "pc" {
-			cmdPC(base, rest)
+			cmdPC(base, rest[1:])
 			return
 		}
 		connect(base, rest[0], strings.Join(rest[1:], " "))
