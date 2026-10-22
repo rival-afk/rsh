@@ -653,7 +653,7 @@ func apiDo(base, method, path, token string) (int, []byte, error) {
 }
 
 func cmdAdminAdd(base string, args []string) {
-	var pub, role, hosts, label string
+	var pub, role, hosts, label, capsCSV string
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--key":
@@ -665,6 +665,9 @@ func cmdAdminAdd(base string, args []string) {
 		case "--hosts":
 			i++
 			hosts = args[i]
+		case "--caps":
+			i++
+			capsCSV = args[i]
 		case "--label":
 			i++
 			label = args[i]
@@ -689,6 +692,9 @@ func cmdAdminAdd(base string, args []string) {
 	}
 	if hosts != "" {
 		payload["hosts"] = strings.Split(hosts, ",")
+	}
+	if capsCSV != "" {
+		payload["caps"] = strings.Split(capsCSV, ",")
 	}
 	code, b, err := apiPost(base, "/v1/admin/keys", token, payload)
 	if err != nil {
