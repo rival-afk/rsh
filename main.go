@@ -1333,9 +1333,9 @@ func pcExecSSH(ar *authResp, base, remoteCmd string) {
 }
 
 func cmdPC(base string, args []string) {
+	// голый `rsh pc` = `rsh pc on`: разбудить по WoL и открыть ssh-сессию
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: rsh pc <on|off|reboot|status|exec ...>")
-		os.Exit(1)
+		args = []string{"on"}
 	}
 	ar, err := authenticate()
 	if err != nil {
@@ -1805,6 +1805,8 @@ usage:
   rsh register            create account on auth server (waits for admin approval)
   rsh admin add           register a pubkey (needs admin key)
       --key "<pubkey>" --role user|admin [--hosts vps,phone,pc] [--label name]
+      --caps console,ssh
+  rsh pc                  wake by WoL (if needed) + interactive ssh (= "pc on")
   rsh admin list          list registered keys
   rsh admin rm <id>       remove a key
   rsh net ip              print this device's LAN IPv4
