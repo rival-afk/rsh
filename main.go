@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -612,10 +613,26 @@ func knownHostsFile() string {
 	return filepath.Join(rshDir(), "known_hosts")
 }
 
+// ensureKeyFile writes the provisioned private key under a UNIQUE per-call
+// name (<host>.<nano>): each rsh invocation re-provisions, and two overlapping
+// calls used to overwrite each other's key file (-> Permission denied races).
+// Files older than an hour become orphaned → swept here.
 func ensureKeyFile(name, content string) (string, error) {
 	dir := filepath.Join(rshDir(), "ssh")
 	os.MkdirAll(dir, 0o700)
-	p := filepath.Join(dir, name)
+	// свип неактуальных ключей этой цели
+	if ents, e := os.ReadDir(dir); e == nil {
+		for _, ent := range ents {
+			fn := ent.Name()
+			if !strings.HasPrefix(fn, name+".") || fn == name {
+				continue
+			}
+			if inf, e := ent.Info(); e == nil && time.Since(inf.ModTime()) > time.Hour {
+				os.Remove(filepath.Join(dir, fn))
+			}
+		}
+	}
+	p := filepath.Join(dir, fmt.Sprintf("%s.%d", name, time.Now().UnixNano()))
 	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
 		return "", err
 	}
@@ -684,69 +701,122 @@ func shQ(s string) string {
 //   - push: src "-" берёт данные из stdin;   pull: dst "-" пишет в stdout
 //     transport: тот же ssh-канал (туннель), remote: mkdir(dirname)+cat. Без sftp —
 //     работает и на redmi (sshd без sftp-подсистемы).
+//
+// remotePath — путь таргета для remote-команды (уже shell-кавыченный).
+// "~" разворачиваем в удалённом shell: `"$HOME"` расширяется (в одинарных
+// кавычках ~ НЕ расширяется — иначе создаётся литеральный каталог "~/").
+func remotePath(p string) string {
+	if strings.HasPrefix(p, "~") {
+		return `"$HOME"` + shQ(strings.TrimPrefix(p, "~"))
+	}
+	return shQ(p)
+}
+
+func sha256hex(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
 func cmdTransfer(base, mode string, args []string) {
 	if len(args) != 3 {
 		fmt.Fprintln(os.Stderr, "usage: rsh push <host> <localfile|-> <remotepath>\n       rsh pull <host> <remotepath> <localfile|->")
 		os.Exit(1)
 	}
 	host, a, b := args[0], args[1], args[2]
-	var remoteCmd string
-	if mode == "push" {
-		remoteCmd = `mkdir -p "$(dirname -- ` + shQ(b) + `)" && cat -- > ` + shQ(b)
-	} else {
-		remoteCmd = `cat -- ` + shQ(a)
-	}
-	bin, argv, err := sshArgv(base, host, remoteCmd)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%v\n", err)
-		os.Exit(1)
-	}
-	if os.Getenv("RSH_DUMP") == "1" {
-		fmt.Fprintln(os.Stderr, "ssh "+strings.Join(argv, " "))
-	}
-	var ebuf bytes.Buffer
-	cmd := exec.Command(bin, argv[1:]...)
-	cmd.Args[0] = bin
-	cmd.Stderr = &ebuf
+
+	// push буферизуем: нужна локальная sha256 для верификации туда-обратно
+	var data []byte
 	if mode == "push" {
 		if a == "-" {
-			cmd.Stdin = os.Stdin
+			d, rerr := io.ReadAll(io.LimitReader(os.Stdin, 512<<20))
+			if rerr != nil {
+				fmt.Fprintf(os.Stderr, "push: stdin: %v\n", rerr)
+				os.Exit(1)
+			}
+			data = d
 		} else {
-			f, oerr := os.Open(a)
-			if oerr != nil {
-				fmt.Fprintf(os.Stderr, "push: %v\n", oerr)
+			d, rerr := os.ReadFile(a)
+			if rerr != nil {
+				fmt.Fprintf(os.Stderr, "push: %v\n", rerr)
+				os.Exit(1)
+			}
+			data = d
+		}
+	}
+
+	doRun := func(remoteCmd string, r io.Reader, so io.Writer) (string, string, error) {
+		bin, argv, err := sshArgv(base, host, remoteCmd)
+		if err != nil {
+			return "", "", err
+		}
+		if os.Getenv("RSH_DUMP") == "1" {
+			fmt.Fprintln(os.Stderr, "ssh "+strings.Join(argv, " "))
+		}
+		var obuf, ebuf bytes.Buffer
+		cmd := exec.Command(bin, argv[1:]...)
+		cmd.Args[0] = bin
+		cmd.Stderr = &ebuf
+		if r != nil {
+			cmd.Stdin = r
+		}
+		if so != nil {
+			cmd.Stdout = so
+		} else {
+			cmd.Stdout = &obuf // иначе вывод уходит в /dev/null
+		}
+		err = cmd.Run()
+		return obuf.String(), strings.TrimSpace(ebuf.String()), err
+	}
+
+	switch mode {
+	case "push":
+		rp := remotePath(b)
+		localHash := sha256hex(data)
+		var lastErr error
+		for attempt := 1; attempt <= 3; attempt++ {
+			cmd := "mkdir -p \"$(dirname -- " + rp + ")\" && cat -- > " + rp
+			_, eout, rerr := doRun(cmd, bytes.NewReader(data), nil)
+			if rerr != nil {
+				lastErr = fmt.Errorf("%v: %s", rerr, eout)
+				fmt.Fprintf(os.Stderr, "push (попытка %d): %v\n", attempt, lastErr)
+				time.Sleep(time.Second)
+				continue
+			}
+			// верификация: sha256 на таргете
+			verifyOut, _, verr := doRun("sha256sum -- "+rp+" 2>/dev/null | cut -d ' ' -f1", nil, nil)
+			if verr == nil && strings.TrimSpace(verifyOut) == localHash {
+				return
+			}
+			lastErr = fmt.Errorf("sha256 не совпал (таргет отдал %q)", strings.TrimSpace(verifyOut))
+			fmt.Fprintf(os.Stderr, "push (попытка %d): %v — ретрай\n", attempt, lastErr)
+			time.Sleep(time.Second)
+		}
+		fmt.Fprintf(os.Stderr, "push не удался: %v\n", lastErr)
+		os.Exit(1)
+	case "pull":
+		var out io.Writer
+		var f *os.File
+		var err error
+		if b == "-" {
+			out = os.Stdout
+		} else {
+			f, err = os.Create(b)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "pull: %v\n", err)
 				os.Exit(1)
 			}
 			defer f.Close()
-			cmd.Stdin = f
+			out = f
 		}
-		if rerr := cmd.Run(); rerr != nil {
-			fmt.Fprintf(os.Stderr, "push не удался: %v\n%s\n", rerr, strings.TrimSpace(ebuf.String()))
+		ra := remotePath(a)
+		_, ebuf, rerr := doRun("cat -- "+ra, nil, out)
+		if rerr != nil {
+			if b != "-" {
+				os.Remove(b) // не оставляем полупустой файл
+			}
+			fmt.Fprintf(os.Stderr, "pull не удался: %v\n%s\n", rerr, ebuf)
 			os.Exit(1)
 		}
-		return
-	}
-	// pull
-	var out io.Writer
-	var f *os.File
-	if b == "-" {
-		out = os.Stdout
-	} else {
-		f, err = os.Create(b)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "pull: %v\n", err)
-			os.Exit(1)
-		}
-		defer f.Close()
-		out = f
-	}
-	cmd.Stdout = out
-	if rerr := cmd.Run(); rerr != nil {
-		if b != "-" {
-			os.Remove(b) // не оставляем полупустой файл
-		}
-		fmt.Fprintf(os.Stderr, "pull не удался: %v\n%s\n", rerr, strings.TrimSpace(ebuf.String()))
-		os.Exit(1)
 	}
 }
 
