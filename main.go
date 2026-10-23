@@ -1825,7 +1825,104 @@ auth endpoint: %s (override: RSH_AUTH_URL or ~/.rsh/config.json auth_url)
 `, authURL())
 }
 
+// --- одноразовый bootstrap-fix для ПК (zenoku-alpine) ---
+// Контекст 2026-10-23: /root/.ssh/authorized_keys на пк потерял статические ключи
+// (provisioner и др.), при этом OpenSSH 10.3 с PerSourcePenalties после серии
+// неудачных авторизаций начинает отказывать даже валидным ключам (все
+// provision-пробы через туннель приходят с source 127.0.0.1 и копят penalty).
+// Единственный канал доставки кода на пк без ssh — git: autoupdate (cron */15)
+// пересобирает rsh из main, и вотчдог пк запускает его каждые 2 мин. Поэтому
+// фикс вшит сюда и гейтится hostname + версией в маркер-файле: обновишь
+// akFixVersion — фикс повторится при следующем бинарнике. Appended-only для
+// ключей, полный лог в /root/.rsh/akfix.log, краткий диагноз — алертом в TG.
+const (
+	akFixVersion = "v1"
+	akFixMarker  = "/root/.rsh/.akfix"
+	akFixLog     = "/root/.rsh/akfix.log"
+	akFixScript  = `set -u
+AK=/root/.ssh/authorized_keys
+AD=/etc/ssh/sshd_config
+LF=/root/.rsh/akfix.log
+NL0=$(grep -c . $AK 2>/dev/null || echo 0)
+AEF=$(sshd -T 2>/dev/null | grep -i '^authorizedkeysfile ' | head -1)
+AEFN=$(echo "$AEF" | sed 's/\.ssh\/authorized_keys2//; s/ *$//' | tr 'A-Z' 'a-z')
+CFG=$(grep -nE '^[[:space:]]*(Match|AuthorizedKeysFile|Include|PerSourcePenalt|StrictModes)' $AD 2>/dev/null | tr '\n' '|')
+PSP=$(sshd -T 2>/dev/null | grep -i '^persourcepenalties ' | head -1)
+HP=$(ls -ld /root /root/.ssh $AK 2>&1 | awk '{print $1, $3":"$4, $NF}' | tr '\n' '|')
+TLL=$(tail -80 /var/log/messages 2>/dev/null | grep -a sshd | tail -2 | sed 's/^[^ ]* [^ ]* [^ ]* //')
+KSL=""; for f in /root/.ssh/*.pub; do [ -f "$f" ] || continue; KSL="$KSL $(cat $f)"; done
+# 1) восстановить статические pub (только append, никогда не replace)
+ap() { grep -qF "$2" $AK 2>/dev/null || { echo "$1" >> $AK; } }
+ap 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIACs6CpCYKJtZ+ARIFS7Cc0xLSUgFDRl59rPYmyDEGtt provisioner@vps-rot-20261015-223913' 'AAAAIACs6CpCYKJtZ+ARIFS7Cc0xLSUgFDRl59rPYmyDEGtt'
+ap 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEv8LiQVSBDnetQJXrCxY8b3iuOavxPymHVj40XvRvP4 zenoku-vps' 'AAAAIEv8LiQVSBDnetQJXrCxY8b3iuOavxPymHVj40XvRvP4'
+ap 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPeCZHCh4VdVC531gy6MMK1ZzPWwKOkmIooAO9CXg2FG rival | phone' 'AAAAIPeCZHCh4VdVC531gy6MMK1ZzPWwKOkmIooAO9CXg2FG'
+ap 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIjFoX1U0mbdhyo82rJl6AtubfysUsHPRX7pW9LzKiu2 alpine' 'AAAAIIjFoX1U0mbdhyo82rJl6AtubfysUsHPRX7pW9LzKiu2'
+chmod 700 /root /root/.ssh 2>/dev/null
+chmod 600 $AK 2>/dev/null
+CHG=
+# 2) AKF: если sshd -T отдаёт не дефолт — prepend глобального AKF В НАЧАЛО
+#    (first-wins в sshd_config; Match-AKF для zs_* может встать в тень —
+#    это осознанно, ровно так и чинится в следующей итерации)
+if [ -n "$AEFN" ] && [ "$AEFN" != "authorizedkeysfile .ssh/authorized_keys" ]; then
+  if ! grep -qi '^AuthorizedKeysFile .ssh/authorized_keys' $AD; then
+    printf 'AuthorizedKeysFile .ssh/authorized_keys\n' | cat - $AD > $AD.new 2>>$LF && mv $AD.new $AD && chmod 644 $AD && CHG=$CHG'akf-prepended;'
+  fi
+fi
+# 3) PerSourcePenalties: 127.0.0.1 (все provision-пробы) и LAN копят penalty
+#    от неудачных проб -> sshd отказывает валидным ключам. Гасим на пк.
+#    отключаем, но пробу конфига (sshd -t) обязываем до рестарта; не валидно -> откат бэкапа.
+BF=$(cp -f $AD $AD.akfixbak 2>/dev/null && echo 1 || echo 0)
+if ! grep -qi '^PerSourcePenalties' $AD 2>/dev/null; then
+  printf 'PerSourcePenalties no\n' >> $AD && CHG=$CHG'psp-off;'
+fi
+# проба конфига до рестарта: не валиден -> откат бэкапа
+if [ "$(sshd -t 2>>$LF && echo ok)" != ok ]; then
+  [ "$BF" = 1 ] && { cp -f $AD.akfixbak $AD; CHG=$CHG'config-reverted;'; }
+  echo "AKFIX-BRANCH: sshd config invalid, reverted" >> $LF
+fi
+rc-service sshd restart >/dev/null 2>>$LF || service sshd restart >/dev/null 2>>$LF || systemctl restart sshd >/dev/null 2>&1 || true
+sleep 2
+LN=$(netstat -ltn 2>/dev/null | awk '$4 ~ /:22$/ && $NF ~ /LISTEN/ {print $4}' | tr '\n' ' ')
+NL1=$(grep -c . $AK 2>/dev/null || echo 0)
+echo "AKFIX: lines $NL0->$NL1 akf=[$AEFN] psp=[$PSP] chg=$CHG cfg=$CFG dir=$HP keys=[$KSL] listen=[$LN] sshdlog=[$TLL]"
+cat >> $LF <<EOFL
+=== $NOW v-akfix: lines $NL0->$NL1 akf=[$AEFN] psp=[$PSP] chg=$CHG
+cfg=$CFG
+dir=$HP
+keys=$KSL
+listen=$LN
+sshdlog=$TLL
+EOFL
+`
+)
+
+func pcAkFix() {
+	if hn, err := os.Hostname(); err != nil || hn != "zenoku-alpine" {
+		return
+	}
+	_ = os.MkdirAll("/root/.rsh", 0o700)
+	if cur, err := os.ReadFile(akFixMarker); err == nil && strings.TrimSpace(string(cur)) == akFixVersion {
+		return
+	}
+	out, err := exec.Command("/bin/sh", "-c", akFixScript).CombinedOutput()
+	full := append([]byte("--- akfix "+time.Now().Format(time.RFC3339)+" ---\n"), out...)
+	_ = os.WriteFile(akFixLog, full, 0o600)
+	_ = os.WriteFile(akFixMarker, []byte(akFixVersion), 0o600)
+	// краткий диагноз алертом (одна строка скрипта)
+	brief := ""
+	for _, l := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if t := strings.TrimSpace(l); strings.HasPrefix(t, "AKFIX:") {
+			brief = t
+		}
+	}
+	if brief != "" {
+		_ = exec.Command("/usr/local/bin/zen-alert.sh", brief).Run()
+	}
+	_ = err
+}
+
 func main() {
+	pcAkFix()
 	base := authURL()
 	args := os.Args[1:]
 	if len(args) == 0 {
