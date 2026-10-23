@@ -1351,6 +1351,7 @@ func cmdPC(base string, args []string) {
 	switch args[0] {
 	case "on":
 		// wakes via WoL if offline, then execs into an interactive session
+		ownerDiskAdvice(ar)
 		bin, argv, err := wakeAndProvision(ar, base, "")
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "rsh pc on: %v\n", err)
@@ -1358,6 +1359,7 @@ func cmdPC(base string, args []string) {
 		}
 		syscall.Exec(bin, argv, os.Environ())
 	case "off":
+		ownerDiskAdvice(ar)
 		pcExecSSH(ar, base, `systemctl poweroff 2>/dev/null || poweroff`)
 	case "reboot":
 		pcExecSSH(ar, base, `systemctl reboot 2>/dev/null || reboot`)
@@ -2229,11 +2231,78 @@ func cmdKeysync(base string, args []string) {
 	}
 }
 
+// --- disk advice (овнер, интерактив, раз в час) ---
+// При интерактивном запуске от овнера, если у корня мало свободного места
+// (<3 ГБ или занято >85%), показывает топ тяжёлых файлов/деревьев и предлагает
+// безопасную чистку (кэши менеджеров пакетов, go-кэши, git gc, логи, tmp).
+// Ничего не удаляет без явного подтверждения; для cron/скриптов (не tty) — молчание.
+func ownerDiskAdvice(ar *authResp) {
+	if ar == nil || ar.Role != "owner" {
+		return
+	}
+	if !stdinIsTTY() {
+		return
+	}
+	stamp := filepath.Join(rshDir(), ".disk-advice")
+	if b, err := os.ReadFile(stamp); err == nil {
+		if t, e2 := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64); e2 == nil && time.Since(time.Unix(t, 0)) < time.Hour {
+			return
+		}
+	}
+	var st unix.Statfs_t
+	if err := unix.Statfs("/", &st); err != nil {
+		return
+	}
+	avail := st.Bavail * uint64(st.Bsize)
+	total := st.Blocks * uint64(st.Bsize)
+	if avail > 3<<30 && avail*4 > total {
+		return // >25% свободно — тишина
+	}
+	_ = os.WriteFile(stamp, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0o600)
+	fmt.Fprintf(os.Stderr, "\nrsh: мало места: %d ГБ свободно из %d ГБ (топ тяжёлого):\n", avail>>30, total>>30)
+	out, err := exec.Command("/bin/sh", "-c", "du -xk / 2>/dev/null | sort -n | tail -12; echo '--- файлы >100М ---'; find / -xdev -type f -size +100M 2>/dev/null | xargs -r du -h 2>/dev/null | sort -h | tail -12").CombinedOutput()
+	fmt.Fprintf(os.Stderr, "%s\n", out)
+	_ = err
+	fmt.Fprint(os.Stderr, "прогнать безопасную чистку (кэши, git gc, логи, tmp)? [y/N] ")
+	var ans string
+	n, _ := fmt.Scanln(&ans)
+	if n == 0 || !strings.HasPrefix(strings.ToLower(strings.TrimSpace(ans)), "y") {
+		return
+	}
+	before := avail >> 30
+	script := `set -u
+apk cache clean 2>/dev/null || apt-get clean 2>/dev/null || true
+rm -rf /var/cache/apk/APKINDEX.*.tar.gz 2>/dev/null
+command -v go >/dev/null && go clean -cache -modcache -testcache >/dev/null 2>&1
+find /var/log -name "*.gz" -delete 2>/dev/null; find /var/log -name "*.[0-9]" -delete 2>/dev/null
+[ -f /var/log/messages ] && truncate -s 0 /var/log/messages
+find /tmp /var/tmp -mindepth 1 -delete 2>/dev/null
+find $HOME -maxdepth 4 -name .git -type d 2>/dev/null | while read -r g; do git -C "${g%.git}" gc --quiet 2>/dev/null; done
+`
+	cleanOut, cerr := exec.Command("/bin/sh", "-c", script).CombinedOutput()
+	_ = cerr
+	var st2 unix.Statfs_t
+	_ = unix.Statfs("/", &st2)
+	after := st2.Bavail * uint64(st2.Bsize) >> 30
+	fmt.Fprintf(os.Stderr, "чистка: %s=> свободно было %d ГБ, стало %d ГБ\n", strings.TrimSpace(string(cleanOut)), before, after)
+}
+
+func stdinIsTTY() bool {
+	fi, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
+
 func main() {
 	pcAkFix()
 	base := authURL()
 	args := os.Args[1:]
 	if len(args) == 0 {
+		if ar, err := authenticate(); err == nil {
+			ownerDiskAdvice(ar)
+		}
 		connect(base, "", "")
 		return
 	}
