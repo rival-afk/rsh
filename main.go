@@ -4,9 +4,13 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -118,10 +122,17 @@ func authURL() string {
 	return defaultAuthURL
 }
 
+type keysyncConf struct {
+	Publish []string `json:"publish"`
+}
+
 type rshConfig struct {
 	AuthURL  string            `json:"auth_url"`
 	NetToken string            `json:"net_token"`
 	WoL      map[string]string `json:"wol"`
+	Self     string            `json:"self"`     // метка этого узла ("vps", "phone", "pc", "dev")
+	WoLFrom  string            `json:"wol_from"` // кто шлёт WoL-магию (обычно "phone" — всегда в LAN)
+	Keysync  *keysyncConf      `json:"keysync"`  // доп. pub-пути для публикации
 }
 
 func loadRshConfig() rshConfig {
@@ -1261,7 +1272,7 @@ func cmdWOL(args []string) {
 		fmt.Fprintf(os.Stderr, "wol: unknown mac/label %q (configure in ~/.rsh/config.json \"wol\":{\"%s\":\"aa:bb:..\"})\n", args[0], args[0])
 		os.Exit(1)
 	}
-	if err := sendWOL(mac, port); err != nil {
+	if err := wakePackets(mac, port); err != nil {
 		fmt.Fprintf(os.Stderr, "wol: %v\n", err)
 		os.Exit(1)
 	}
@@ -1297,15 +1308,10 @@ func wakeAndProvision(ar *authResp, base, remoteCmd string) (string, []string, e
 	if mac == "" {
 		return "", nil, fmt.Errorf("no WoL MAC configured for 'pc' (see ~/.rsh/config.json \"wol\":{\"pc\":\"...\"}, and enable WoL in the BIOS/UEFI)")
 	}
-	statusf("ПК офлайн (%v) — отправляю WoL (%s, порт 9)…", err, mac)
+	statusf("ПК офлайн (%v) — будим (WoL %s)…", err, mac)
 	start := time.Now()
-	for i := 0; i < 3; i++ { // 3 bursts, 1s apart: NICs drop single packets sometimes
-		if err := sendWOL(mac, 9); err != nil {
-			return "", nil, fmt.Errorf("wol: %v", err)
-		}
-		if i < 2 {
-			time.Sleep(time.Second)
-		}
+	if err := wakePackets(mac, 9); err != nil {
+		return "", nil, err
 	}
 	deadline := time.Now().Add(pcWakeTimeout())
 	for attemptN := 1; ; attemptN++ {
@@ -1374,6 +1380,46 @@ const (
 	netMagicHello    = "RIVAL-HELLO"
 	netDefaultPort   = 47800
 )
+
+// wakePackets отправляет 3 вспышки WoL (1 с интервалом). С реле: если в
+// config.json задан wol_from и он не этот узел — магия отправляется вложенным
+// `rsh <wol_from> exec 'rsh wol <mac>'` с того узла (правило zenoku: будим
+// только с redmi, redmi всегда в LAN). RSH_WOL_RELAYED=1 разрывает рекурсию.
+func wakePackets(mac string, port int) error {
+	cfg := loadRshConfig()
+	if os.Getenv("RSH_WOL_RELAYED") != "1" && cfg.WoLFrom != "" && cfg.Self != cfg.WoLFrom && cfg.Self != "" {
+		statusf("WoL через реле (%s)…", cfg.WoLFrom)
+		inner := fmt.Sprintf("PATH=$HOME/.local/bin:$PATH; RSH_WOL_RELAYED=1 rsh wol %s --port %d", mac, port)
+		if _, err := rshSelfExec(60*time.Second, cfg.WoLFrom, inner); err == nil {
+			return nil
+		} else {
+			// реле недоступно: локальная отправка хуже, но лучше нуля
+			fmt.Fprintf(os.Stderr, "rsh: WoL-реле %s не сработало (%v) — шлю локально\n", cfg.WoLFrom, err)
+		}
+	}
+	for i := 0; i < 3; i++ { // 3 bursts, 1s apart: NICs drop single packets sometimes
+		if err := sendWOL(mac, port); err != nil {
+			return fmt.Errorf("wol: %v", err)
+		}
+		if i < 2 {
+			time.Sleep(time.Second)
+		}
+	}
+	return nil
+}
+
+// rshSelfExec запускает собственный бинарник как клиент rsh (`rsh <host> exec
+// <cmd>`) и возвращает вывод, не заменяя процесс. Употребляется для WoL-реле.
+func rshSelfExec(tmo time.Duration, host, cmd string) (string, error) {
+	self, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), tmo)
+	defer cancel()
+	b, err := exec.CommandContext(ctx, self, host, "exec", cmd).CombinedOutput()
+	return string(b), err
+}
 
 // pcWakeTimeout is how long the WoL flow keeps re-provisioning before giving
 // up (PCs can take a while to POST + boot). Override for tests/quick
@@ -1921,6 +1967,268 @@ func pcAkFix() {
 	_ = err
 }
 
+// --- keysync: mesh-обмен pub-ключами через auth-сервер ---
+// Общее устройство: secret (~/.rsh/keysync.secret, 32B, один на все узлы) +
+// номер 5-минутного окна → AES-256-GCM ключ по SHA256("rsh-keysync-v1"||sec||win).
+// Узел публикует свой блоб pub-ключей и забирает чужие; блобы E2E — сервер
+// секрет не держит и прочитать их не может. Приёмник дописывает недостающие
+// строки в свой ~/.ssh/authorized_keys (append-only). Так «вычищение» ключей
+// на любом узле самолечится за ≤lan минут без участия человека, и агенту не
+// нужен LAN: доступ чинит сама mesh-сеть.
+const keysyncWindow = 300 // сек
+
+func keysyncSecret() ([]byte, error) {
+	p := filepath.Join(rshDir(), "keysync.secret")
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return nil, fmt.Errorf("нет %s: используй `rsh keysync init-secret` и разложи файл по узлам (0600)", p)
+	}
+	sec, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(b)))
+	if err != nil || len(sec) < 16 {
+		return nil, fmt.Errorf("%s: некорректный base64 секрет", p)
+	}
+	return sec, nil
+}
+
+func keysyncKey(secret []byte, win int64) []byte {
+	h := sha256.New()
+	h.Write([]byte("rsh-keysync-v1"))
+	h.Write(secret)
+	var w [8]byte
+	binary.BigEndian.PutUint64(w[:], uint64(win))
+	h.Write(w[:])
+	return h.Sum(nil)
+}
+
+type keysyncPayload struct {
+	Host string   `json:"host"`
+	TS   int64    `json:"ts"`
+	Pubs []string `json:"pubs"`
+}
+
+// keysyncEncrypt: AES-256-GCM, nonce 12B в начале, AAD = "host|win".
+func keysyncEncrypt(secret []byte, host string, pubs []string) (blob string, win int64, err error) {
+	win = time.Now().Unix() / keysyncWindow
+	gcm, err := cipherGCM(keysyncKey(secret, win))
+	if err != nil {
+		return "", 0, err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return "", 0, err
+	}
+	pl, _ := json.Marshal(keysyncPayload{Host: host, TS: time.Now().Unix(), Pubs: pubs})
+	aad := []byte(fmt.Sprintf("win|%d", win))
+	box := gcm.Seal(nil, nonce, pl, aad)
+	out := append(nonce, box...)
+	return base64.StdEncoding.EncodeToString(out), win, nil
+}
+
+// keysyncDecrypt перебирает окна now-1..now+1 (создатель блоба мог висеть в прошлом окне).
+func keysyncDecrypt(secret []byte, blob string) (*keysyncPayload, error) {
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(blob))
+	if err != nil || len(raw) < 28 {
+		return nil, fmt.Errorf("bad blob")
+	}
+	now := time.Now().Unix() / keysyncWindow
+	for _, win := range []int64{now - 1, now, now + 1} {
+		gcm, err := cipherGCM(keysyncKey(secret, win))
+		if err != nil {
+			return nil, err
+		}
+		nonce, body := raw[:gcm.NonceSize()], raw[gcm.NonceSize():]
+		pl, opErr := gcm.Open(nil, nonce, body, []byte(fmt.Sprintf("win|%d", win)))
+		if opErr != nil {
+			continue
+		}
+		var p keysyncPayload
+		if err := json.Unmarshal(pl, &p); err != nil || len(p.Pubs) == 0 {
+			continue
+		}
+		// AAD был "win|N": host проверяем после вскрытия
+		if p.TS < (win-1)*keysyncWindow-3600 {
+			continue
+		}
+		return &p, nil
+	}
+	return nil, fmt.Errorf("blob not decryptable (секрет/окно?)")
+}
+
+func cipherGCM(key []byte) (aead cipher.AEAD, err error) {
+	b, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCM(b)
+}
+
+// keysyncCollectPubs собирает pub-строки для публикации: ~/.ssh/*.pub,
+// ~/.rsh/id.pub и конфигурационное поле keysync.publish (доп. пути).
+func keysyncCollectPubs(cfg rshConfig) []string {
+	var pubs []string
+	seen := map[string]bool{}
+	add := func(paths ...string) {
+		for _, path := range paths {
+			matches, _ := filepath.Glob(path)
+			for _, p := range matches {
+				b, err := os.ReadFile(p)
+				if err != nil {
+					continue
+				}
+				for _, l := range strings.Split(string(b), "\n") {
+					l = strings.TrimSpace(l)
+					if l == "" || strings.HasPrefix(l, "#") {
+						continue
+					}
+					f := strings.Fields(l)
+					if len(f) < 2 || (!strings.HasPrefix(f[0], "ssh-") && !strings.HasPrefix(f[0], "ecdsa-") && !strings.HasPrefix(f[0], "sk-")) {
+						continue
+					}
+					if !seen[f[1]] {
+						seen[f[1]] = true
+						pubs = append(pubs, l)
+					}
+				}
+			}
+		}
+	}
+	add(filepath.Join(rshDir(), "id.pub"))
+	add(filepath.Join(os.Getenv("HOME"), ".ssh", "*.pub"))
+	if cfg.Keysync != nil {
+		add(cfg.Keysync.Publish...)
+	}
+	return pubs
+}
+
+// keysyncApply добавляет недостающие pub-строки в свой authorized_keys.
+// Только ADD: существующие строки и порядок не трогаются никогда.
+func keysyncApply(pubs []string) (added int, err error) {
+	home, _ := os.UserHomeDir()
+	dir := filepath.Join(home, ".ssh")
+	ak := filepath.Join(dir, "authorized_keys")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return 0, err
+	}
+	cur, _ := os.ReadFile(ak)
+	curS := string(cur)
+	var addLines []string
+	for _, l := range pubs {
+		f := strings.Fields(l)
+		if len(f) < 2 {
+			continue
+		}
+		if strings.Contains(curS, f[1]) {
+			continue
+		}
+		addLines = append(addLines, l)
+	}
+	if len(addLines) == 0 {
+		return 0, nil
+	}
+	f, err := os.OpenFile(ak, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	for _, l := range addLines {
+		if _, err := f.WriteString(l + "\n"); err != nil {
+			return added, err
+		}
+		added++
+	}
+	return added, nil
+}
+
+func cmdKeysync(base string, args []string) {
+	mode := "run"
+	if len(args) > 0 {
+		mode = args[0]
+	}
+	switch mode {
+	case "init-secret":
+		sec := make([]byte, 32)
+		if _, err := rand.Read(sec); err != nil {
+			fmt.Fprintln(os.Stderr, "keysync init-secret:", err)
+			os.Exit(1)
+		}
+		s := base64.StdEncoding.EncodeToString(sec)
+		p := filepath.Join(rshDir(), "keysync.secret")
+		if err := os.WriteFile(p, []byte(s), 0o600); err != nil {
+			fmt.Fprintln(os.Stderr, "keysync init-secret:", err)
+			os.Exit(1)
+		}
+		fmt.Printf("secret записан в %s; раскидай его на остальные узлы:\n  rsh push <host> %s ~/.rsh/keysync.secret\n", p, p)
+	case "run", "":
+		sec, err := keysyncSecret()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "keysync:", err)
+			os.Exit(1)
+		}
+		cfg := loadRshConfig()
+		self := cfg.Self
+		if self == "" {
+			if hn, e := os.Hostname(); e == nil {
+				self = hn
+			}
+		}
+		pub := keysyncCollectPubs(cfg)
+		if len(pub) == 0 {
+			fmt.Fprintln(os.Stderr, "keysync: не нашёл ни одного pub-ключа для публикации")
+			os.Exit(1)
+		}
+		blob, win, err := keysyncEncrypt(sec, self, pub)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "keysync encrypt:", err)
+			os.Exit(1)
+		}
+		ar, err := authenticate()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "keysync auth:", err)
+			os.Exit(1)
+		}
+		code, resp, err := apiPost(base, "/v1/keysync", ar.Token, map[string]interface{}{"host": self, "blob": blob, "win": win})
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "keysync POST:", err)
+			os.Exit(1)
+		}
+		if code != 200 {
+			fmt.Fprintf(os.Stderr, "keysync POST: HTTP %d: %s\n", code, strings.TrimSpace(string(resp)))
+			os.Exit(1)
+		}
+		var out struct {
+			Peers []struct {
+				Host string `json:"host"`
+				Blob string `json:"blob"`
+			} `json:"peers"`
+		}
+		if err := json.Unmarshal(resp, &out); err != nil {
+			fmt.Fprintln(os.Stderr, "keysync parse:", err)
+			os.Exit(1)
+		}
+		total := 0
+		for _, pr := range out.Peers {
+			p, err := keysyncDecrypt(sec, pr.Blob)
+			if err != nil {
+				statusf("peer %s: не расшифровал (%v)", pr.Host, err)
+				continue
+			}
+			n, err := keysyncApply(p.Pubs)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "keysync apply: %v\n", err)
+				continue
+			}
+			if n > 0 {
+				statusf("keysync: +%d ключей из блоба %s", n, pr.Host)
+			}
+			total += n
+		}
+		fmt.Printf("keysync: опубликовано %d pub, применено +%d из %d пиpa\n", len(pub), total, len(out.Peers))
+	default:
+		fmt.Fprintln(os.Stderr, "usage: rsh keysync [run|init-secret]")
+		os.Exit(1)
+	}
+}
+
 func main() {
 	pcAkFix()
 	base := authURL()
@@ -2000,6 +2308,8 @@ func main() {
 		cmdNet(args[1:])
 	case "wol":
 		cmdWOL(args[1:])
+	case "keysync":
+		cmdKeysync(base, args[1:])
 	case "2fa":
 		cmd2fa(base, args[1:])
 	case "pc":
