@@ -1350,16 +1350,16 @@ func cmdPC(base string, args []string) {
 	}
 	switch args[0] {
 	case "on":
-		// wakes via WoL if offline, then execs into an interactive session
-		ownerDiskAdvice(ar)
+		// сначала будим и подключаемся (WoL при офлайне), и только затем
+		// думаем о месте — причём о диске ПК, а не той машины, откуда rsh запущен
 		bin, argv, err := wakeAndProvision(ar, base, "")
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "rsh pc on: %v\n", err)
 			os.Exit(1)
 		}
+		pcDiskAdvice(ar, base)
 		syscall.Exec(bin, argv, os.Environ())
 	case "off":
-		ownerDiskAdvice(ar)
 		pcExecSSH(ar, base, `systemctl poweroff 2>/dev/null || poweroff`)
 	case "reboot":
 		pcExecSSH(ar, base, `systemctl reboot 2>/dev/null || reboot`)
@@ -2253,8 +2253,11 @@ func ownerDiskAdvice(ar *authResp) {
 	if err := unix.Statfs("/", &st); err != nil {
 		return
 	}
-	avail := st.Bavail * uint64(st.Bsize)
 	total := st.Blocks * uint64(st.Bsize)
+	avail := st.Bavail * uint64(st.Bsize)
+	if total == 0 {
+		return // не fs (напр. Termux /) — измерение бессмысленно, молчим
+	}
 	if avail > 3<<30 && avail*4 > total {
 		return // >25% свободно — тишина
 	}
@@ -2285,6 +2288,77 @@ find $HOME -maxdepth 4 -name .git -type d 2>/dev/null | while read -r g; do git 
 	_ = unix.Statfs("/", &st2)
 	after := st2.Bavail * uint64(st2.Bsize) >> 30
 	fmt.Fprintf(os.Stderr, "чистка: %s=> свободно было %d ГБ, стало %d ГБ\n", strings.TrimSpace(string(cleanOut)), before, after)
+}
+
+// pcDiskAdvice — совет по месту на ДИСКЕ ПК. Вызывается из `rsh pc on` ПОСЛЕ
+// wakeAndProvision: пк уже разбужен и соединение есть. Всю выборку делает
+// удалённый ssh-exec (df, du/find-топ, опциональная чистка); ответ [y/N]
+// читается локально из tty. Любая ошибка = тихий выход, совет не мешает входу.
+func pcDiskAdvice(ar *authResp, base string) {
+	if ar == nil || ar.Role != "owner" {
+		return
+	}
+	if !stdinIsTTY() {
+		return
+	}
+	stamp := filepath.Join(rshDir(), ".disk-advice-pc")
+	if b, err := os.ReadFile(stamp); err == nil {
+		if t, e2 := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64); e2 == nil && time.Since(time.Unix(t, 0)) < time.Hour {
+			return
+		}
+	}
+	runSSH := func(cmd string) string {
+		bin, argv, err := sshArgvAuthed(ar, base, "pc", cmd)
+		if err != nil {
+			return ""
+		}
+		out, err := exec.Command(bin, argv...).CombinedOutput()
+		if err != nil && len(out) == 0 {
+			return ""
+		}
+		return strings.TrimSpace(string(out))
+	}
+	remoteStat := func() (total, avail uint64) {
+		fields := strings.Fields(runSSH(`df -k / | tail -1`))
+		if len(fields) < 4 {
+			return 0, 0
+		}
+		totalK, e1 := strconv.ParseUint(fields[1], 10, 64)
+		availK, e2 := strconv.ParseUint(fields[3], 10, 64)
+		if e1 != nil || e2 != nil || totalK == 0 {
+			return 0, 0
+		}
+		return totalK << 10, availK << 10
+	}
+	avail, total := remoteStat()
+	if total == 0 {
+		return
+	}
+	if avail > 3<<30 && avail*4 > total {
+		return // >25% свободно — тишина
+	}
+	_ = os.WriteFile(stamp, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0o600)
+	fmt.Fprintf(os.Stderr, "\nrsh: пк: мало места: %d ГБ свободно из %d ГБ (топ тяжёлого):\n", avail>>30, total>>30)
+	top := runSSH(`du -xk / 2>/dev/null | sort -n | tail -12; echo '--- файлы >100М ---'; find / -xdev -type f -size +100000k 2>/dev/null | xargs -r du -h 2>/dev/null | sort -h | tail -12`)
+	fmt.Fprintf(os.Stderr, "%s\n", top)
+	fmt.Fprint(os.Stderr, "прогнать безопасную чистку на пк (кэши, git gc, логи, tmp)? [y/N] ")
+	var ans string
+	n, _ := fmt.Scanln(&ans)
+	if n == 0 || !strings.HasPrefix(strings.ToLower(strings.TrimSpace(ans)), "y") {
+		return
+	}
+	before := avail >> 30
+	out := runSSH(`set -u
+apk cache clean 2>/dev/null || apt-get clean 2>/dev/null || true
+rm -rf /var/cache/apk/APKINDEX.*.tar.gz 2>/dev/null
+command -v go >/dev/null && go clean -cache -modcache -testcache >/dev/null 2>&1
+find /var/log -name "*.gz" -delete 2>/dev/null; find /var/log -name "*.[0-9]" -delete 2>/dev/null
+[ -f /var/log/messages ] && truncate -s 0 /var/log/messages
+find /tmp /var/tmp -mindepth 1 -delete 2>/dev/null
+find $HOME -maxdepth 4 -name .git -type d 2>/dev/null | while read -r g; do git -C "${g%.git}" gc --quiet 2>/dev/null; done
+`)
+	after, _ := remoteStat()
+	fmt.Fprintf(os.Stderr, "чистка: %s=> свободно было %d ГБ, стало %d ГБ\n", strings.TrimSpace(string(out)), before, after>>30)
 }
 
 func stdinIsTTY() bool {
