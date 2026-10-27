@@ -1073,6 +1073,13 @@ func connect(base, target string, remoteCmd string) {
 		sshArgs = append(sshArgs, "-o", "ProxyCommand="+proxy)
 	}
 
+	// интерактивные команды (nano/vim/htop...) требуют pty: если stdin —
+	// настоящий терминал и есть команда — выделяем tty. В каналах
+	// (cat | rsh ... 'cat > f') stdin не tty → поведение прежнее.
+	if strings.TrimSpace(remoteCmd) != "" && stdinIsTTY() {
+		sshArgs = append(sshArgs, "-t")
+	}
+
 	sshArgs = append(sshArgs, "-p", strconv.Itoa(sk.Port), fmt.Sprintf("%s@%s", sk.User, sk.Addr))
 	if tmpN > 0 {
 		if strings.TrimSpace(sk.ClientIP) == "" {
@@ -1166,6 +1173,12 @@ func sshArgvAuthed(ar *authResp, base, target, remoteCmd string, extraOpts ...st
 	}
 	for _, o := range extraOpts {
 		args = append(args, "-o", o)
+	}
+	// интерактивные команды (nano/vim/htop...) требуют pty: если stdin —
+	// настоящий терминал и есть remoteCmd — выделяем tty. В каналах
+	// (cat | rsh ... 'cat > f') stdin не tty → поведение прежнее.
+	if strings.TrimSpace(remoteCmd) != "" && stdinIsTTY() {
+		args = append(args, "-t")
 	}
 	args = append(args, "-p", strconv.Itoa(sk.Port), fmt.Sprintf("%s@%s", sk.User, sk.Addr))
 	if tmpN > 0 {
