@@ -2375,11 +2375,11 @@ find $HOME -maxdepth 4 -name .git -type d 2>/dev/null | while read -r g; do git 
 }
 
 func stdinIsTTY() bool {
-	fi, err := os.Stdin.Stat()
-	if err != nil {
-		return false
-	}
-	return fi.Mode()&os.ModeCharDevice != 0
+	// /dev/null и /dev/zero — тоже char-device, поэтому ModeCharDevice-чек
+	// врёт. Настоящий терминал опознаём по TCGETS-ioctl (только у tty он
+	// отвечает).
+	_, err := unix.IoctlGetTermios(int(os.Stdin.Fd()), unix.TCGETS)
+	return err == nil
 }
 
 func main() {
