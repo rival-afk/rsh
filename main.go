@@ -325,6 +325,7 @@ func doAuth(baseURL string, k authKey, totp, recovery string) (*authResp, error)
 		"device_token": loadDeviceToken(),
 		"totp":         totp,
 		"recovery":     recovery,
+		"hwid":         hwidHash(),
 	})
 	resp, err := authClient.Post(baseURL+"/v1/auth", "application/json", bytes.NewReader(body))
 	if err != nil {
@@ -1030,7 +1031,7 @@ func connect(base, target string, remoteCmd string) {
 		host = ar.Hosts[n-1]
 	}
 
-	code, b, err := apiPost(base, "/v1/sshkey", ar.Token, map[string]string{"host": host})
+	code, b, err := apiPost(base, "/v1/sshkey", ar.Token, map[string]string{"host": host, "hwid": hwidHash()})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "sshkey: %v\n", err)
 		os.Exit(1)
@@ -1136,7 +1137,7 @@ func sshArgvAuthed(ar *authResp, base, target, remoteCmd string, extraOpts ...st
 	if !found {
 		return "", nil, fmt.Errorf("host %q not available (allowed: %s)", target, strings.Join(ar.Hosts, ", "))
 	}
-	code, b, err := apiPost(base, "/v1/sshkey", ar.Token, map[string]string{"host": host})
+	code, b, err := apiPost(base, "/v1/sshkey", ar.Token, map[string]string{"host": host, "hwid": hwidHash()})
 	if err != nil {
 		return "", nil, fmt.Errorf("sshkey: %v", err)
 	}
@@ -2372,6 +2373,52 @@ find $HOME -maxdepth 4 -name .git -type d 2>/dev/null | while read -r g; do git 
 `)
 	after, _ := remoteStat()
 	fmt.Fprintf(os.Stderr, "чистка: %s=> свободно было %d ГБ, стало %d ГБ\n", strings.TrimSpace(string(out)), before, after>>30)
+}
+
+// hwidHash — стабильный отпечаток железа (sha256, 16 hex).
+// Источник по приоритету: /etc/machine-id (Alpine/Debian), /var/lib/dbus,
+// product_uuid (dmi), ro.build.fingerprint из /system/build.prop (Termux),
+// фallback: uname-строка. Стабилен между перезагрузками; у каждой инсталляции
+// свой (machine-id генерится при установке системы).
+func hwidHash() string {
+	for _, p := range []string{
+		"/etc/machine-id",
+		"/var/lib/dbus/machine-id",
+		"/sys/class/dmi/id/product_uuid",
+	} {
+		if b, err := os.ReadFile(p); err == nil && strings.TrimSpace(string(b)) != "" {
+			return hwidFrom(strings.TrimSpace(string(b)))
+		}
+	}
+	if b, err := os.ReadFile("/system/build.prop"); err == nil {
+		for _, ln := range strings.Split(string(b), "\n") {
+			if strings.HasPrefix(ln, "ro.build.fingerprint=") {
+				if v := strings.TrimSpace(strings.TrimPrefix(ln, "ro.build.fingerprint=")); v != "" {
+					// + ro.product.model — два устройства одной модели/прошивки
+					modelb, _ := os.ReadFile("/system/build.prop")
+					model := ""
+					for _, m := range strings.Split(string(modelb), "\n") {
+						if strings.HasPrefix(m, "ro.product.model=") {
+							model = strings.TrimSpace(strings.TrimPrefix(m, "ro.product.model="))
+							break
+						}
+					}
+					return hwidFrom(v + "|" + model)
+				}
+			}
+		}
+	}
+	ub, err := exec.Command("uname", "-a").CombinedOutput()
+	if err != nil || strings.TrimSpace(string(ub)) == "" {
+		// совсем без источников — гарантированно отклоняемся от «общего»
+		return hwidFrom("no-ident-source")
+	}
+	return hwidFrom(strings.TrimSpace(string(ub)))
+}
+
+func hwidFrom(stable string) string {
+	s := sha256.Sum256([]byte("rsh-hwid-v1|" + stable))
+	return hex.EncodeToString(s[:8])
 }
 
 func stdinIsTTY() bool {
