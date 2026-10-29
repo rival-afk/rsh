@@ -103,6 +103,11 @@ type sshKeyResp struct {
 }
 
 func rshDir() string {
+	// RSH_HOME — изолированный rsh-дом (например ~/.rsh-agent для агентов с
+	// урезанной ролью admin: свои ключи/токен/known_hosts, владелец недоступен)
+	if v := os.Getenv("RSH_HOME"); v != "" {
+		return v
+	}
 	h, _ := os.UserHomeDir()
 	return filepath.Join(h, ".rsh")
 }
@@ -684,7 +689,7 @@ func apiDo(base, method, path, token string) (int, []byte, error) {
 }
 
 func cmdAdminAdd(base string, args []string) {
-	var pub, role, hosts, label, capsCSV string
+	var pub, role, hosts, label, capsCSV, hwid, saveTok string
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--key":
@@ -702,6 +707,12 @@ func cmdAdminAdd(base string, args []string) {
 		case "--label":
 			i++
 			label = args[i]
+		case "--hwid":
+			i++
+			hwid = args[i]
+		case "--save-token":
+			i++
+			saveTok = args[i]
 		}
 	}
 	if pub == "" {
@@ -727,6 +738,11 @@ func cmdAdminAdd(base string, args []string) {
 	if capsCSV != "" {
 		payload["caps"] = strings.Split(capsCSV, ",")
 	}
+	if hwid != "" {
+		// bootstrap доверенного устройства для нового ключа: сервер выдаст
+		// device-токен (иначе admin без 2FA-пути вообще не пройдёт челлендж)
+		payload["hwid"] = hwid
+	}
 	code, b, err := apiPost(base, "/v1/admin/keys", token, payload)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "request: %v\n", err)
@@ -736,7 +752,20 @@ func cmdAdminAdd(base string, args []string) {
 		fmt.Fprintf(os.Stderr, "add failed (%d): %s\n", code, strings.TrimSpace(string(b)))
 		os.Exit(1)
 	}
-	fmt.Printf("added: %s\n", strings.TrimSpace(string(b)))
+	var out struct {
+		ID          string `json:"id"`
+		DeviceToken string `json:"device_token"`
+	}
+	_ = json.Unmarshal(b, &out)
+	if saveTok != "" && out.DeviceToken != "" {
+		if err := os.WriteFile(saveTok, []byte(out.DeviceToken), 0600); err != nil {
+			fmt.Fprintf(os.Stderr, "save-token failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("added: %s (device_token saved to %s, не печатается)\n", out.ID, saveTok)
+	} else {
+		fmt.Printf("added: %s\n", strings.TrimSpace(string(b)))
+	}
 }
 
 func cmdAdminList(base string) {
