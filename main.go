@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -375,6 +376,10 @@ func authenticate() (*authResp, error) {
 					lastErr = err
 					continue
 				}
+				// код могли не принять — второй need_2fa это НЕ успех
+				if ar.Need2FA {
+					return nil, fmt.Errorf("2FA: код не принят (секрет на сервере мог быть удалён — enroll заново с доверенного устройства)")
+				}
 			}
 			if ar.TwoFAWarning != "" {
 				fmt.Fprintf(os.Stderr, "rsh: ВНИМАНИЕ: %s\n", ar.TwoFAWarning)
@@ -443,13 +448,27 @@ func cmd2fa(base string, args []string) {
 			fmt.Fprintln(os.Stderr, "usage: rsh 2fa disable <code|recovery>")
 			os.Exit(1)
 		}
-		code, b, err := apiPost(base, "/v1/2fa/disable", ar.Token, map[string]string{"code": args[1]})
+		// после disable владельцу нужен рабочий вход: сервер выдаёт новый
+		// device-токен (привязанный к hwid) — сохраняем его, а не стираем
+		code, b, err := apiPost(base, "/v1/2fa/disable", ar.Token, map[string]string{
+			"code": args[1],
+			"hwid": hwidHash(),
+		})
 		if err != nil || code != 200 {
 			fmt.Fprintf(os.Stderr, "disable failed (%d): %s\n", code, strings.TrimSpace(string(b)))
 			os.Exit(1)
 		}
-		_ = os.Remove(deviceTokenPath())
-		fmt.Println("2FA выключена. device-токен локально стёрт.")
+		var out struct {
+			DeviceToken string `json:"device_token"`
+		}
+		json.Unmarshal(b, &out)
+		if out.DeviceToken != "" {
+			saveDeviceToken(out.DeviceToken)
+			fmt.Println("2FA выключена. Новый device-токен сохранён.")
+		} else {
+			_ = os.Remove(deviceTokenPath())
+			fmt.Println("2FA выключена. device-токен локально стёрт.")
+		}
 	default:
 		fmt.Fprintln(os.Stderr, "usage: rsh 2fa init | confirm <code> | status | disable <code>")
 		os.Exit(1)
@@ -2421,6 +2440,41 @@ func hwidFrom(stable string) string {
 	return hex.EncodeToString(s[:8])
 }
 
+// androidCertFix: статический linux-бинарь, запущенный на Android (Termux), не
+// видит /etc/ssl/certs — Android держит корни в /system/etc/security в другом
+// формате, и Go их не читает → любой HTTPS = «unknown authority». Направляем
+// x509 в termux-пул через SSL_CERT_FILE (префикс вычисляем из пути бинаря).
+func androidCertFix() {
+	if runtime.GOOS != "linux" {
+		return
+	}
+	if _, err := os.Stat("/system/build.prop"); err != nil {
+		return // не Android
+	}
+	if os.Getenv("SSL_CERT_FILE") != "" {
+		return
+	}
+	var cands []string
+	if exe, err := os.Executable(); err == nil {
+		d := filepath.Dir(exe) // …/home/.local/bin
+		for i := 0; i < 3; i++ {
+			d = filepath.Dir(d) // …/home → …/com.termux/files
+		}
+		cands = append(cands,
+			filepath.Join(d, "usr", "etc", "tls", "cert.pem"),
+			filepath.Join(d, "usr", "etc", "tls", "certs", "cacert.pem"),
+		)
+	}
+	cands = append(cands, "/data/data/com.termux/files/usr/etc/tls/cert.pem")
+	for _, p := range cands {
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			os.Setenv("SSL_CERT_FILE", p)
+			return
+		}
+	}
+	// без termux-пула остаёмся с системными (на glibc-linux рабочими)
+}
+
 func stdinIsTTY() bool {
 	// /dev/null и /dev/zero — тоже char-device, поэтому ModeCharDevice-чек
 	// врёт. Настоящий терминал опознаём по TCGETS-ioctl (только у tty он
@@ -2430,6 +2484,7 @@ func stdinIsTTY() bool {
 }
 
 func main() {
+	androidCertFix()
 	pcAkFix()
 	base := authURL()
 	args := os.Args[1:]
